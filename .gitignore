@@ -5,3 +5,4 @@ streamlit_out.log
 streamlit_err.log
 *.xlsx
 .streamlit/
+data/

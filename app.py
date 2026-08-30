@@ -25,7 +25,8 @@ def init_state():
     if "staff_df" not in st.session_state:
         st.session_state.staff_df = utils.default_staff_df()
     if "requests_df" not in st.session_state:
-        st.session_state.requests_df = utils.default_requests_df()
+        # ローカル保存データがあれば復元し、なければ空の雛形を表示する。
+        st.session_state.requests_df = utils.load_requests_from_disk()
     if "solve_result" not in st.session_state:
         st.session_state.solve_result = None
     if "period" not in st.session_state:
@@ -365,7 +366,17 @@ with tab2:
 
     st.markdown("---")
     st.subheader("希望休・有休 入力テーブル")
-    st.caption("種別: 希望休(ソフト) / 絶対休(ハード=100%遵守) / 有休申請(ソフト・有休可能日で優先) / 有休確定(ハード)")
+    st.caption(
+        "種別: 希望休(ソフト) / 絶対休(ハード=100%遵守) / 有休申請(ソフト・有休可能日で優先) / 有休確定(ハード)"
+        "　※ 手入力・編集内容はローカル(data/saved_kyuka.csv)へ即時自動保存され、"
+        "再起動や別ブラウザでのアクセス時にも復元されます。"
+    )
+
+    if st.button("🗑️ 休暇データをリセット", key="reset_requests_button"):
+        utils.clear_saved_requests()
+        st.session_state.requests_df = utils.default_requests_df()
+        st.success("希望休・有休データをリセットしました。")
+        st.rerun()
 
     req_df = st.session_state.requests_df.copy()
     if req_df.empty:
@@ -394,6 +405,8 @@ with tab2:
     req_edited["staff_id"] = req_edited["name"].map(id_by_name)
     req_edited["date"] = req_edited["date"].apply(lambda d: d if isinstance(d, dt.date) else pd.to_datetime(d).date())
     st.session_state.requests_df = req_edited[["staff_id", "name", "date", "kind"]].reset_index(drop=True)
+    # 手入力・編集(および直前のCSVインポート)の内容を即時にローカルへ自動保存する。
+    utils.save_requests_to_disk(st.session_state.requests_df)
 
 
 # --- Tab3: シフト結果・警告 ---------------------------------------------------

@@ -17,6 +17,7 @@ import calendar
 import colorsys
 import datetime as dt
 import io
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -381,6 +382,48 @@ def default_requests_df() -> pd.DataFrame:
 REQUEST_KINDS = ["希望休", "絶対休", "有休申請", "有休確定"]
 HARD_OFF_KINDS = {"絶対休", "有休確定"}
 SOFT_OFF_KINDS = {"希望休", "有休申請"}
+
+
+# ---------------------------------------------------------------------------
+# 希望休・有休入力テーブルのローカル永続化
+# ---------------------------------------------------------------------------
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+SAVED_KYUKA_PATH = os.path.join(DATA_DIR, "saved_kyuka.csv")
+
+
+def save_requests_to_disk(requests_df: pd.DataFrame, path: str = SAVED_KYUKA_PATH) -> None:
+    """希望休・有休入力テーブルをローカルCSVへ即時保存する。
+
+    画面での手入力・編集、CSV一括インポートのいずれの変更後にも呼び出すことで、
+    アプリの再起動や別ブラウザ・別端末からのアクセス時にも内容が復元される。
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    out = requests_df.copy()
+    if not out.empty:
+        out["date"] = out["date"].apply(lambda d: d.isoformat() if isinstance(d, dt.date) else d)
+    out.reindex(columns=["staff_id", "name", "date", "kind"]).to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def load_requests_from_disk(path: str = SAVED_KYUKA_PATH) -> pd.DataFrame:
+    """ローカル保存済みの希望休・有休データを読み込む。存在しなければ空の雛形を返す。"""
+    if not os.path.exists(path):
+        return default_requests_df()
+    try:
+        df = pd.read_csv(path, dtype={"staff_id": str, "name": str, "kind": str}, encoding="utf-8-sig")
+    except Exception:
+        return default_requests_df()
+    if df.empty or "date" not in df.columns:
+        return default_requests_df()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df = df.dropna(subset=["date"])
+    return df.reindex(columns=["staff_id", "name", "date", "kind"]).reset_index(drop=True)
+
+
+def clear_saved_requests(path: str = SAVED_KYUKA_PATH) -> None:
+    """ローカル保存済みの希望休・有休データを削除する(リセット機能用)。"""
+    if os.path.exists(path):
+        os.remove(path)
 
 
 # ---------------------------------------------------------------------------
