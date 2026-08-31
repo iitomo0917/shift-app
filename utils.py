@@ -824,7 +824,10 @@ def _min_required_employees_for_store(
 
 
 _LEAVE_REMOVABLE_TYPES = ("店長", "正社員")  # このロジックで「休みに回す」候補となる区分
-_LEAVE_SUBSTITUTE_TYPES = ("正社員", "嘱託")  # 代替要員(ヘルプ投入)となりうる区分
+# 代替要員(ヘルプ投入)となりうる区分。店長・正社員は全員21日出勤(有休確定者は20日)で
+# 固定されており、代替に回すとその分だけ出勤日数が規定を超えてしまうため、
+# 代替候補には絶対に含めない(嘱託・パートのみが対象)。
+_LEAVE_SUBSTITUTE_TYPES = ("嘱託", "パート")
 
 
 def compute_post_solve_leave_availability(
@@ -901,10 +904,17 @@ def compute_post_solve_leave_availability(
         return d not in work_days_by_staff.get(sid, {})
 
     def _has_day_capacity(sid: str) -> bool:
-        if staff_emp_type.get(sid) == "嘱託":
+        """月間勤務日数レンジの上限に、あと+1日勤務する余力があるかを判定する。"""
+        etype = staff_emp_type.get(sid)
+        if etype == "嘱託":
             max_d = staff_max_workdays.get(sid)
             if pd.notna(max_d):
                 return total_workdays_by_staff.get(sid, 0) < int(max_d)
+            return True
+        if etype == "パート":
+            role = staff_part_role.get(sid)
+            _min_d, max_d = PART_ROLE_WORKDAY_RANGE.get(role, (0, len(dates_df)))
+            return total_workdays_by_staff.get(sid, 0) < max_d
         return True
 
     def _six_consecutive_ok(sid: str, d: dt.date) -> bool:
