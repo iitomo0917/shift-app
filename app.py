@@ -29,6 +29,10 @@ def init_state():
         st.session_state.requests_df = utils.load_requests_from_disk()
     if "solve_result" not in st.session_state:
         st.session_state.solve_result = None
+    if "manual_shift_wide" not in st.session_state:
+        st.session_state.manual_shift_wide = None
+    if "manual_shift_wide_initial" not in st.session_state:
+        st.session_state.manual_shift_wide_initial = None
     if "period" not in st.session_state:
         st.session_state.period = (2026, 9)
     if "special_closure_labels" not in st.session_state:
@@ -136,8 +140,16 @@ if run_clicked:
     st.session_state.solve_result = result
     if result.is_feasible:
         st.sidebar.success(f"完了: {result.status_name} (不足アラート {len(result.shortages)}件)")
+        # 新しい最適化結果が出るたびに、手動編集用のワイド表を初期化する
+        # (=以前の手動調整はリセットされる。個別にリセットしたい場合は
+        # タブ3の「手動変更をリセット」ボタンで初期状態に戻せる)。
+        manual_wide = utils.build_manual_shift_wide(result.shift_df, dates_df)
+        st.session_state.manual_shift_wide = manual_wide.copy()
+        st.session_state.manual_shift_wide_initial = manual_wide.copy()
     else:
         st.sidebar.error(f"求解失敗: {result.status_name}")
+        st.session_state.manual_shift_wide = None
+        st.session_state.manual_shift_wide_initial = None
 
 
 # ---------------------------------------------------------------------------
@@ -484,8 +496,76 @@ with tab3:
         else:
             st.success("人員不足はありません。全店舗・全日で必要体制を充足しています。")
 
+        # 手動編集がない場合のデフォルトはAI最適化結果そのもの。
+        # 手動編集がある場合は、以降の有休枠算出・Excel出力にもその内容を反映する。
+        st.session_state.effective_shift_df = result.shift_df
+
         st.markdown("---")
-        st.subheader("店舗別シフト表")
+        st.subheader("シフト表の手動編集（プルダウンで玉突き調整）")
+        st.caption(
+            "セルをクリックしてプルダウンからスタッフ名（または「（空白）」）を選択すると、"
+            "店舗間の玉突き調整ができます。編集内容は保持され、他のタブへ移動しても"
+            "失われません。編集後は下のアラートが自動的に再判定されます。"
+        )
+
+        if st.session_state.manual_shift_wide is None:
+            st.info("最適化結果がありません。")
+        else:
+            if st.button("↩️ 手動変更をリセット（最適化直後の状態に戻す）", key="reset_manual_shift_button"):
+                st.session_state.manual_shift_wide = st.session_state.manual_shift_wide_initial.copy()
+                st.rerun()
+
+            date_labels_manual = utils.manual_shift_date_labels(dates_df)
+            name_options_manual = [utils.BLANK_LABEL] + st.session_state.staff_df["name"].tolist()
+
+            display_wide = st.session_state.manual_shift_wide.copy()
+            for label in date_labels_manual:
+                display_wide[label] = display_wide[label].replace("", utils.BLANK_LABEL)
+
+            column_config_manual = {
+                "店舗": st.column_config.TextColumn("店舗", disabled=True),
+                "枠": st.column_config.NumberColumn("枠", disabled=True),
+            }
+            for label in date_labels_manual:
+                column_config_manual[label] = st.column_config.SelectboxColumn(label, options=name_options_manual)
+
+            edited_wide = st.data_editor(
+                display_wide,
+                column_config=column_config_manual,
+                hide_index=True,
+                width="stretch",
+                num_rows="fixed",
+                key="manual_shift_editor",
+            )
+
+            stored_wide = edited_wide.copy()
+            for label in date_labels_manual:
+                stored_wide[label] = stored_wide[label].replace(utils.BLANK_LABEL, "")
+            st.session_state.manual_shift_wide = stored_wide
+
+            manual_shift_long = utils.manual_shift_wide_to_long(stored_wide, dates_df, st.session_state.staff_df)
+            st.session_state.effective_shift_df = manual_shift_long
+            manual_alerts = utils.check_manual_shift_alerts(manual_shift_long, st.session_state.staff_df, dates_df)
+
+            if manual_alerts["duplicates"]:
+                for dup in manual_alerts["duplicates"]:
+                    d = dup["date"]
+                    st.markdown(
+                        f"<span style='color:#FF0000;font-weight:bold'>⚠️ {d.month}/{d.day}: "
+                        f"{dup['name']} が複数店舗（{'、'.join(dup['stores'])}）に重複配置されています</span>",
+                        unsafe_allow_html=True,
+                    )
+            for s in manual_alerts["shortages"]:
+                d = s["date"]
+                st.warning(f"⚠️ {d.month}/{d.day} {s['store']}：人員不足（現在: {s['詳細']}）")
+            for s in manual_alerts["skill_issues"]:
+                d = s["date"]
+                st.warning(f"⚠️ {d.month}/{d.day} {s['store']}：測定・加工スキル保有者が不在です")
+            if not (manual_alerts["duplicates"] or manual_alerts["shortages"] or manual_alerts["skill_issues"]):
+                st.success("手動編集後のシフトに問題は検出されませんでした。")
+
+        st.markdown("---")
+        st.subheader("店舗別シフト表（AI最適化結果・参考表示）")
         shift_df = result.shift_df
         if shift_df.empty:
             st.info("出勤データがありません。")
@@ -527,7 +607,7 @@ with tab3:
             "営業日ごとに算出しています。"
         )
         post_availability_df = utils.compute_post_solve_leave_availability(
-            result.shift_df, st.session_state.staff_df, dates_df, st.session_state.requests_df
+            st.session_state.effective_shift_df, st.session_state.staff_df, dates_df, st.session_state.requests_df
         )
         st.session_state["post_availability_df"] = post_availability_df
 
@@ -573,9 +653,13 @@ with tab4:
         st.info("先にサイドバーで最適化を実行してください。")
     else:
         st.subheader("Excel(.xlsx) エクスポート")
-        st.caption("シート1: 店舗別日別シフト表 / シート2: スタッフ別出勤一覧表")
+        st.caption(
+            "シート1: 店舗別日別シフト表 / シート2: スタッフ別出勤一覧表　"
+            "※タブ3で手動調整した内容がある場合は、その内容がそのまま反映されます。"
+        )
+        export_shift_df = st.session_state.get("effective_shift_df", result.shift_df)
         workbook_bytes = utils.build_export_workbook(
-            result.shift_df, dates_df, st.session_state.staff_df, st.session_state.requests_df
+            export_shift_df, dates_df, st.session_state.staff_df, st.session_state.requests_df
         )
         st.download_button(
             label="⬇️ シフト表をダウンロード (.xlsx)",

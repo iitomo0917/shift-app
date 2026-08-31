@@ -974,11 +974,192 @@ def generate_post_solve_leave_announcement(
     return "\n".join(lines)
 
 
+_EMP_TYPE_SORT_ORDER = {"店長": 0, "正社員": 1, "嘱託": 2, "パート": 3}
+
+
+# ---------------------------------------------------------------------------
+# シフト結果の画面上手動編集(玉突き調整)
+# ---------------------------------------------------------------------------
+
+BLANK_LABEL = "（空白）"
+
+
+def manual_shift_date_labels(dates_df: pd.DataFrame) -> list[str]:
+    """手動編集テーブルの列見出し(営業日のみ)を返す。"""
+    business_days_df = dates_df[dates_df["is_business_day"]]
+    return [f"{d.month}/{d.day}({wd})" for d, wd in zip(business_days_df["date"], business_days_df["weekday_jp"])]
+
+
+def build_manual_shift_wide(
+    shift_df: pd.DataFrame,
+    dates_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """最適化結果(長形式)を、手動編集用のワイド形式(店舗×営業日、1セル1名)に変換する。
+
+    各店舗は STORE_MAX_HEADCOUNT 分の行(枠)を持ち、店舗別日別シフト表と同じ
+    レイアウトになる。空きセルは空文字列で表現する。
+    """
+    business_days_df = dates_df[dates_df["is_business_day"]]
+    dates = list(business_days_df["date"])
+    date_labels = manual_shift_date_labels(dates_df)
+
+    rows = []
+    for store in STORES:
+        n_slots = STORE_MAX_HEADCOUNT.get(store, 2)
+        per_date_names: dict[dt.date, list[str]] = {}
+        for d in dates:
+            if shift_df.empty:
+                day_rows = pd.DataFrame(columns=["name", "emp_type"])
+            else:
+                day_rows = shift_df[(shift_df["store"] == store) & (shift_df["date"] == d)]
+            names = sorted(
+                day_rows["name"].tolist(),
+                key=lambda nm: _EMP_TYPE_SORT_ORDER.get(
+                    day_rows.loc[day_rows["name"] == nm, "emp_type"].iloc[0], 9
+                ),
+            )
+            per_date_names[d] = names
+        for slot in range(n_slots):
+            row = {"店舗": store, "枠": slot + 1}
+            for d, label in zip(dates, date_labels):
+                names = per_date_names[d]
+                row[label] = names[slot] if slot < len(names) else ""
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def manual_shift_wide_to_long(
+    wide_df: pd.DataFrame,
+    dates_df: pd.DataFrame,
+    staff_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """手動編集後のワイド形式を、長形式(date/store/staff_id/name/emp_type)へ変換する。
+
+    空欄(空文字列 または BLANK_LABEL)は無視する。存在しない氏名が入っていた
+    場合も安全側でスキップする(クラッシュしない)。
+    """
+    date_labels = manual_shift_date_labels(dates_df)
+    label_to_date = dict(zip(date_labels, dates_df.loc[dates_df["is_business_day"], "date"]))
+    name_to_id = dict(zip(staff_df["name"], staff_df["staff_id"]))
+    emp_type_by_name = dict(zip(staff_df["name"], staff_df["emp_type"]))
+
+    rows = []
+    for _, r in wide_df.iterrows():
+        store = r.get("店舗")
+        for label in date_labels:
+            name = r.get(label)
+            if not name or name == BLANK_LABEL:
+                continue
+            if name not in name_to_id:
+                continue
+            rows.append(
+                {
+                    "date": label_to_date[label],
+                    "store": store,
+                    "staff_id": name_to_id[name],
+                    "name": name,
+                    "emp_type": emp_type_by_name[name],
+                }
+            )
+    return pd.DataFrame(rows, columns=["date", "store", "staff_id", "name", "emp_type"])
+
+
+def _check_store_day_pattern(
+    store: str,
+    e_count: int,
+    part_roles_present: set[str],
+    is_weekend_holiday: bool,
+) -> tuple[bool, int]:
+    """店舗・曜日区分ごとの成立パターンに照らして、現在の在籍構成が有効か判定する。
+
+    optimizer.py の店舗別ハード制約と同じ判定基準(平日/土日祝の違いを含む)。
+    戻り値は (成立しているか, 不足人数の目安)。
+    """
+    if store == TOKUSHIGE_STORE:
+        if is_weekend_holiday:
+            ok = e_count >= 2
+        else:
+            ok = e_count >= 2 or (e_count == 1 and {"B", "C"} <= part_roles_present)
+    elif store in COMBO_STORE_PART_ROLES and store != "大治店":
+        roles = set(COMBO_STORE_PART_ROLES[store])
+        if is_weekend_holiday:
+            ok = e_count >= 2
+        else:
+            ok = e_count >= 2 or (e_count == 1 and bool(part_roles_present & roles))
+    elif store == "大治店":
+        ok = (e_count == 2) or (e_count == 1 and len(part_roles_present) >= 1)
+    else:
+        ok = e_count == 2
+    shortfall = 0 if ok else max(0, 2 - e_count)
+    return ok, shortfall
+
+
+def check_manual_shift_alerts(
+    shift_df: pd.DataFrame,
+    staff_df: pd.DataFrame,
+    dates_df: pd.DataFrame,
+) -> dict[str, list[dict]]:
+    """手動編集後のシフト(長形式)に対し、重複出勤・人員不足・スキル不在を再判定する。
+
+    戻り値: {"duplicates": [...], "shortages": [...], "skill_issues": [...]}
+    """
+    alerts: dict[str, list[dict]] = {"duplicates": [], "shortages": [], "skill_issues": []}
+
+    staff_emp_type = dict(zip(staff_df["staff_id"], staff_df["emp_type"]))
+    staff_has_skill = dict(zip(staff_df["staff_id"], staff_df["has_skill"]))
+    staff_part_role = dict(zip(staff_df["staff_id"], staff_df["part_role"]))
+    staff_name = dict(zip(staff_df["staff_id"], staff_df["name"]))
+
+    if not shift_df.empty:
+        for (sid, d), grp in shift_df.groupby(["staff_id", "date"]):
+            if len(grp) > 1:
+                alerts["duplicates"].append(
+                    {
+                        "date": d,
+                        "name": staff_name.get(sid, sid),
+                        "stores": grp["store"].unique().tolist(),
+                    }
+                )
+
+    business_days_df = dates_df[dates_df["is_business_day"]]
+    for _, day in business_days_df.iterrows():
+        d = day["date"]
+        is_wh = bool(day["is_weekend_or_holiday"])
+        day_shift = shift_df[shift_df["date"] == d] if not shift_df.empty else pd.DataFrame()
+        for store in STORES:
+            store_shift = day_shift[day_shift["store"] == store]
+            e_count = 0
+            part_roles_present: set[str] = set()
+            has_skill_here = False
+            staffed = False
+            for sid in store_shift["staff_id"]:
+                etype = staff_emp_type.get(sid)
+                if etype in EMPLOYEE_TYPES:
+                    e_count += 1
+                    staffed = True
+                elif etype == "パート":
+                    role = staff_part_role.get(sid)
+                    if role:
+                        part_roles_present.add(role)
+                    staffed = True
+                if staff_has_skill.get(sid):
+                    has_skill_here = True
+
+            ok, shortfall = _check_store_day_pattern(store, e_count, part_roles_present, is_wh)
+            if not ok:
+                detail = f"社員{e_count}名"
+                if part_roles_present:
+                    detail += f"+パート{len(part_roles_present)}名"
+                alerts["shortages"].append({"date": d, "store": store, "不足数": shortfall, "詳細": detail})
+            if staffed and not has_skill_here:
+                alerts["skill_issues"].append({"date": d, "store": store})
+
+    return alerts
+
+
 # ---------------------------------------------------------------------------
 # Excelエクスポート
 # ---------------------------------------------------------------------------
-
-_EMP_TYPE_SORT_ORDER = {"店長": 0, "正社員": 1, "嘱託": 2, "パート": 3}
 
 
 def _generate_pastel_palette(n: int, lightness: float = 0.84, saturation: float = 0.55) -> list[str]:
