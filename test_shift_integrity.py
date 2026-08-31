@@ -390,6 +390,103 @@ def check_heavy_conflict_no_crash() -> list[str]:
     return []
 
 
+def check_manual_shift_alerts_robustness() -> list[str]:
+    """未計算月度への切り替え等で shift_df が None/空/列欠損になった場合でも
+    check_manual_shift_alerts がクラッシュしないことを確認する(回帰確認)。"""
+    issues = []
+    dates = utils.get_period_dates(2026, 9)
+    dates_df = utils.classify_days(dates)
+    staff_df = utils.default_staff_df()
+    cases = {
+        "None": None,
+        "empty_no_columns": pd.DataFrame(),
+        "properly_empty": pd.DataFrame(columns=["date", "store", "staff_id", "name", "emp_type"]),
+        "not_a_dataframe": "garbage",
+    }
+    for label, shift_df in cases.items():
+        try:
+            alerts = utils.check_manual_shift_alerts(shift_df, staff_df, dates_df)
+            if alerts != {"duplicates": [], "shortages": [], "skill_issues": []}:
+                issues.append(f"{label}: 想定外のアラートが返された({alerts})")
+        except Exception as e:  # noqa: BLE001 - このチェック自体が「例外が出ないこと」を検証する
+            issues.append(f"{label}: 例外が発生しクラッシュした({type(e).__name__}: {e})")
+    return issues
+
+
+def check_month_switch_no_crash_and_kyuka_isolation() -> list[str]:
+    """実際のStreamlitアプリ(app.py)上で、(1)最適化済みの月度から未計算の別月度へ
+    切り替えてもクラッシュせず結果がリセットされること、(2)月度ごとの希望休データが
+    互いに独立して保存・復元されることを、AppTestで実機に近い形で確認する。
+    """
+    issues = []
+    # このチェックは実際の app.py (本番の data/ ディレクトリを参照) を通すため、
+    # 既存の実運用データを壊さないよう、対象月度の保存ファイルを一時退避し、
+    # 終了後に必ず元の内容へ復元する。
+    target_paths = [utils.saved_kyuka_path_for(y, m) for y, m in [(2026, 9), (2026, 11)]] + [
+        utils.LATEST_SHIFT_PATH,
+        utils.LATEST_SHIFT_META_PATH,
+    ]
+    backups: dict[str, bytes] = {}
+    for p in target_paths:
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                backups[p] = f.read()
+            os.remove(p)
+
+    try:
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file("app.py", default_timeout=120)
+        at.run()
+        at.sidebar.button[0].click().run()
+        if list(at.exception):
+            issues.append(f"初回最適化で例外: {at.exception}")
+
+        sid = at.session_state["staff_df"].loc[at.session_state["staff_df"]["name"] == "生駒", "staff_id"].iloc[0]
+        sept_df = pd.concat(
+            [
+                at.session_state["requests_df"],
+                pd.DataFrame([{"staff_id": sid, "name": "生駒", "date": dt.date(2026, 9, 20), "kind": "希望休"}]),
+            ],
+            ignore_index=True,
+        )
+        at.session_state["requests_df"] = sept_df
+        at.run()
+
+        month_selectbox = at.sidebar.selectbox[0]
+        month_selectbox.select(11).run()
+        if list(at.exception):
+            issues.append(f"未計算月度(11月)への切り替えで例外(=クラッシュ再現): {at.exception}")
+        if at.session_state["solve_result"] is not None:
+            issues.append("月度切り替え後もsolve_resultが古い月度のまま残っている")
+        if len(at.session_state["requests_df"]) != 0:
+            issues.append("月度切り替え後、希望休データが空になっていない(月度分離の不備)")
+
+        tab3 = at.tabs[2]
+        if not any("最適化を実行" in i.value for i in tab3.info):
+            issues.append("未計算月度でタブ3に案内メッセージが表示されない")
+        if list(at.exception):
+            issues.append(f"タブ3描画時に例外: {at.exception}")
+
+        month_selectbox2 = at.sidebar.selectbox[0]
+        month_selectbox2.select(9).run()
+        restored = at.session_state["requests_df"]
+        if len(restored) != 1 or restored.iloc[0]["name"] != "生駒":
+            issues.append(f"9月度に戻した際の希望休データが正しく復元されない(件数={len(restored)})")
+    finally:
+        # 一時退避したファイルを元に戻す。テストが新規作成したファイルのうち
+        # 元々存在しなかったものは削除する。
+        for p in target_paths:
+            if p in backups:
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as f:
+                    f.write(backups[p])
+            elif os.path.exists(p):
+                os.remove(p)
+
+    return issues
+
+
 # ---------------------------------------------------------------------------
 # メイン実行
 # ---------------------------------------------------------------------------
@@ -431,6 +528,11 @@ def main():
     record("6a. 別期間(10/10を含まない月)でのクラッシュ非発生と基本要件", check_different_period_no_crash())
     record("6b. 特別休業日を含む期間の整合性", check_special_closure_days_integration())
     record("6c. 大量休み希望衝突時のクラッシュ非発生", check_heavy_conflict_no_crash())
+    record("7a. check_manual_shift_alerts の異常入力耐性", check_manual_shift_alerts_robustness())
+    record(
+        "7b. 月度切り替え時のクラッシュ非発生・希望休データ分離",
+        check_month_switch_no_crash_and_kyuka_isolation(),
+    )
 
     print()
     print("-" * 70)

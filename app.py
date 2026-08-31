@@ -25,10 +25,14 @@ def init_state():
     if "staff_df" not in st.session_state:
         st.session_state.staff_df = utils.default_staff_df()
     if "requests_df" not in st.session_state:
-        # ローカル保存データがあれば復元し、なければ空の雛形を表示する。
-        st.session_state.requests_df = utils.load_requests_from_disk()
+        # 実際の読み込みは対象月度が確定した後(サイドバー処理内)に月度別ファイルから
+        # 行う。ここでは空の雛形とし、requests_df_period を None にしておくことで
+        # 「まだこの期間用のデータを読み込んでいない」ことを示す。
+        st.session_state.requests_df = utils.default_requests_df()
+        st.session_state.requests_df_period = None
     if "solve_result" not in st.session_state:
         st.session_state.solve_result = None
+        st.session_state.solve_result_period = None
         # ローカル保存済みの最適化結果があれば、後続のdates_df確定後に復元を試みる
         # (この時点ではまだ対象期間が確定していないため、読み込みだけ行っておく)。
         loaded_shift_df, loaded_meta = utils.load_shift_result_from_disk()
@@ -84,12 +88,22 @@ def recompute_allowed_stores(staff_df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 st.sidebar.title("設定")
 
-year = st.sidebar.number_input("対象年", min_value=2020, max_value=2100, value=st.session_state.period[0])
+# 年・月の各ウィジェットは明示的な key で Streamlit にネイティブに状態管理させる。
+# 以前は index=/value= に st.session_state.period (=ウィジェット自身の出力から
+# 都度再計算される値) を渡していたため、非keyウィジェットの自動生成IDが
+# 再実行のたびに変化し、2回目以降の月度切り替えが正しく反映されない不安定な
+# フィードバックループが発生していた(test_shift_integrity.pyで検出)。
+if "sidebar_year" not in st.session_state:
+    st.session_state.sidebar_year = st.session_state.period[0]
+if "sidebar_month" not in st.session_state:
+    st.session_state.sidebar_month = st.session_state.period[1]
+
+year = st.sidebar.number_input("対象年", min_value=2020, max_value=2100, key="sidebar_year")
 month = st.sidebar.selectbox(
     "対象月",
     options=list(range(1, 13)),
-    index=st.session_state.period[1] - 1,
     format_func=lambda m: f"{m}月度",
+    key="sidebar_month",
 )
 st.session_state.period = (year, month)
 
@@ -113,6 +127,17 @@ special_closure_dates = [special_closure_label_to_date[l] for l in st.session_st
 dates_df = utils.classify_days(period_dates, special_closure_dates=special_closure_dates)
 st.sidebar.markdown(f"**シフト期間:** {period_label}")
 
+# 対象期間(月度)を切り替えた場合、直前まで保持していた最適化結果は別の月度の
+# ものであり、この期間にはそのまま使えない(店舗別日別シフト表の日付列と
+# 噛み合わなくなり、シフト結果タブでクラッシュする原因になっていた)。
+# 期間が一致しない場合は「未計算」の状態に戻す(=タブ3は「最適化を実行してください」
+# の案内表示になる)。
+if st.session_state.solve_result is not None and st.session_state.get("solve_result_period") != (year, month):
+    st.session_state.solve_result = None
+    st.session_state.solve_result_period = None
+    st.session_state.manual_shift_wide = None
+    st.session_state.manual_shift_wide_initial = None
+
 # ローカル保存済みの最適化結果を、対象期間確定後に一度だけ復元する
 # (別ブラウザ・別端末からのアクセス時や再起動時でも、保存内容がこの期間と
 # 一致していれば「最適化を実行」を押さずにシフト結果タブが表示される)。
@@ -130,10 +155,19 @@ if st.session_state.solve_result is None and st.session_state.get("_pending_shif
             objective_value=float(_loaded_meta.get("objective_value", 0.0)),
             solver_wall_time=float(_loaded_meta.get("solver_wall_time", 0.0)),
         )
+        st.session_state.solve_result_period = (year, month)
         _wide = utils.build_manual_shift_wide(_loaded_shift_df, dates_df)
         st.session_state.manual_shift_wide = _wide.copy()
         st.session_state.manual_shift_wide_initial = _wide.copy()
     st.session_state._pending_shift_restore = None
+
+# 希望休・有休データは月度ごとに完全に独立したファイルで管理する。対象月度が
+# 変わったら、その月度専用の保存ファイルを読み込み直す(無ければ空の雛形)。
+# 2〜3ヶ月先の月度に切り替えて先行入力・保存しても、他の月度のデータと
+# 混ざったり上書きされたりしない。
+if st.session_state.get("requests_df_period") != (year, month):
+    st.session_state.requests_df = utils.load_requests_from_disk(path=utils.saved_kyuka_path_for(year, month))
+    st.session_state.requests_df_period = (year, month)
 
 closed_days_count_sidebar = int((~dates_df["is_business_day"]).sum())
 special_closure_count_sidebar = int(dates_df["is_special_closure"].sum())
@@ -170,6 +204,7 @@ if run_clicked:
             time_limit_sec=time_limit_sec,
         )
     st.session_state.solve_result = result
+    st.session_state.solve_result_period = (int(year), int(month))
     if result.is_feasible:
         st.sidebar.success(f"完了: {result.status_name} (不足アラート {len(result.shortages)}件)")
         # 新しい最適化結果が出るたびに、手動編集用のワイド表を初期化する
@@ -457,14 +492,15 @@ with tab2:
     st.subheader("希望休・有休 入力テーブル")
     st.caption(
         "種別: 希望休(ソフト) / 絶対休(ハード=100%遵守) / 有休申請(ソフト・有休可能日で優先) / 有休確定(ハード)"
-        "　※ 手入力・編集内容はローカル(data/saved_kyuka.csv)へ即時自動保存され、"
-        "再起動や別ブラウザでのアクセス時にも復元されます。"
+        f"　※ 手入力・編集内容は月度ごとに独立したファイル(data/saved_kyuka_{year}_{month:02d}.csv)へ"
+        "即時自動保存され、再起動や別ブラウザでのアクセス時にも復元されます。"
+        "2〜3ヶ月先の月度に切り替えて先行入力しても、他の月度のデータとは混ざりません。"
     )
 
-    if st.button("🗑️ 休暇データをリセット", key="reset_requests_button"):
-        utils.clear_saved_requests()
+    if st.button("🗑️ 休暇データをリセット（この月度のみ）", key="reset_requests_button"):
+        utils.clear_saved_requests(path=utils.saved_kyuka_path_for(year, month))
         st.session_state.requests_df = utils.default_requests_df()
-        st.success("希望休・有休データをリセットしました。")
+        st.success(f"{period_label}の希望休・有休データをリセットしました。")
         st.rerun()
 
     req_df = st.session_state.requests_df.copy()
@@ -494,8 +530,9 @@ with tab2:
     req_edited["staff_id"] = req_edited["name"].map(id_by_name)
     req_edited["date"] = req_edited["date"].apply(lambda d: d if isinstance(d, dt.date) else pd.to_datetime(d).date())
     st.session_state.requests_df = req_edited[["staff_id", "name", "date", "kind"]].reset_index(drop=True)
-    # 手入力・編集(および直前のCSVインポート)の内容を即時にローカルへ自動保存する。
-    utils.save_requests_to_disk(st.session_state.requests_df)
+    # 手入力・編集(および直前のCSVインポート)の内容を、この月度専用のファイルへ
+    # 即時にローカル自動保存する(未来の月度の先行入力もそのまま保存される)。
+    utils.save_requests_to_disk(st.session_state.requests_df, path=utils.saved_kyuka_path_for(year, month))
 
 
 # --- Tab3: シフト結果・警告 ---------------------------------------------------

@@ -406,7 +406,16 @@ SOFT_OFF_KINDS = {"希望休", "有休申請"}
 # ---------------------------------------------------------------------------
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-SAVED_KYUKA_PATH = os.path.join(DATA_DIR, "saved_kyuka.csv")
+SAVED_KYUKA_PATH = os.path.join(DATA_DIR, "saved_kyuka.csv")  # 旧・月度非分離のデフォルトパス(後方互換用)
+
+
+def saved_kyuka_path_for(year: int, month: int) -> str:
+    """月度別(シフト期間開始年月)の希望休・有休データの保存パスを返す。
+
+    未来の月度(2〜3ヶ月先等)の希望休を先行入力・保存できるよう、月度ごとに
+    完全に独立したファイルで管理する。
+    """
+    return os.path.join(DATA_DIR, f"saved_kyuka_{int(year)}_{int(month):02d}.csv")
 
 
 def save_requests_to_disk(requests_df: pd.DataFrame, path: str = SAVED_KYUKA_PATH) -> None:
@@ -1215,30 +1224,38 @@ def check_manual_shift_alerts(
     """手動編集後のシフト(長形式)に対し、重複出勤・人員不足・スキル不在を再判定する。
 
     戻り値: {"duplicates": [...], "shortages": [...], "skill_issues": [...]}
+
+    shift_df が None/空/想定外の形(必要な列が無い等)の場合は、まだ最適化が
+    実行されていない月度などに切り替えた際にクラッシュしないよう、判定を
+    行わずに空のアラート(問題なし扱い)を返す。
     """
     alerts: dict[str, list[dict]] = {"duplicates": [], "shortages": [], "skill_issues": []}
+
+    if shift_df is None or not isinstance(shift_df, pd.DataFrame) or shift_df.empty:
+        return alerts
+    if "date" not in shift_df.columns or "store" not in shift_df.columns or "staff_id" not in shift_df.columns:
+        return alerts
 
     staff_emp_type = dict(zip(staff_df["staff_id"], staff_df["emp_type"]))
     staff_has_skill = dict(zip(staff_df["staff_id"], staff_df["has_skill"]))
     staff_part_role = dict(zip(staff_df["staff_id"], staff_df["part_role"]))
     staff_name = dict(zip(staff_df["staff_id"], staff_df["name"]))
 
-    if not shift_df.empty:
-        for (sid, d), grp in shift_df.groupby(["staff_id", "date"]):
-            if len(grp) > 1:
-                alerts["duplicates"].append(
-                    {
-                        "date": d,
-                        "name": staff_name.get(sid, sid),
-                        "stores": grp["store"].unique().tolist(),
-                    }
-                )
+    for (sid, d), grp in shift_df.groupby(["staff_id", "date"]):
+        if len(grp) > 1:
+            alerts["duplicates"].append(
+                {
+                    "date": d,
+                    "name": staff_name.get(sid, sid),
+                    "stores": grp["store"].unique().tolist(),
+                }
+            )
 
     business_days_df = dates_df[dates_df["is_business_day"]]
     for _, day in business_days_df.iterrows():
         d = day["date"]
         is_wh = bool(day["is_weekend_or_holiday"])
-        day_shift = shift_df[shift_df["date"] == d] if not shift_df.empty else pd.DataFrame()
+        day_shift = shift_df[shift_df["date"] == d]
         for store in STORES:
             store_shift = day_shift[day_shift["store"] == store]
             e_count = 0
