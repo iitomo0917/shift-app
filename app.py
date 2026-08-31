@@ -13,7 +13,7 @@ import pandas as pd
 import streamlit as st
 
 import utils
-from optimizer import solve_shift
+from optimizer import SolveResult, solve_shift
 
 st.set_page_config(page_title="眼鏡店シフト最適化", layout="wide")
 
@@ -29,12 +29,22 @@ def init_state():
         st.session_state.requests_df = utils.load_requests_from_disk()
     if "solve_result" not in st.session_state:
         st.session_state.solve_result = None
+        # ローカル保存済みの最適化結果があれば、後続のdates_df確定後に復元を試みる
+        # (この時点ではまだ対象期間が確定していないため、読み込みだけ行っておく)。
+        loaded_shift_df, loaded_meta = utils.load_shift_result_from_disk()
+        st.session_state._pending_shift_restore = (
+            (loaded_shift_df, loaded_meta) if loaded_shift_df is not None else None
+        )
     if "manual_shift_wide" not in st.session_state:
         st.session_state.manual_shift_wide = None
     if "manual_shift_wide_initial" not in st.session_state:
         st.session_state.manual_shift_wide_initial = None
     if "period" not in st.session_state:
-        st.session_state.period = (2026, 9)
+        pending = st.session_state.get("_pending_shift_restore")
+        if pending and pending[1].get("year") and pending[1].get("month"):
+            st.session_state.period = (int(pending[1]["year"]), int(pending[1]["month"]))
+        else:
+            st.session_state.period = (2026, 9)
     if "special_closure_labels" not in st.session_state:
         st.session_state.special_closure_labels = []
 
@@ -102,6 +112,28 @@ special_closure_dates = [special_closure_label_to_date[l] for l in st.session_st
 
 dates_df = utils.classify_days(period_dates, special_closure_dates=special_closure_dates)
 st.sidebar.markdown(f"**シフト期間:** {period_label}")
+
+# ローカル保存済みの最適化結果を、対象期間確定後に一度だけ復元する
+# (別ブラウザ・別端末からのアクセス時や再起動時でも、保存内容がこの期間と
+# 一致していれば「最適化を実行」を押さずにシフト結果タブが表示される)。
+if st.session_state.solve_result is None and st.session_state.get("_pending_shift_restore"):
+    _loaded_shift_df, _loaded_meta = st.session_state._pending_shift_restore
+    if _loaded_meta.get("year") == year and _loaded_meta.get("month") == month and not _loaded_shift_df.empty:
+        _restored_staff_df = recompute_allowed_stores(st.session_state.staff_df)
+        _restored_summary = utils.build_simple_staff_summary(_loaded_shift_df, _restored_staff_df, dates_df)
+        st.session_state.solve_result = SolveResult(
+            status_name=_loaded_meta.get("status_name", "RESTORED"),
+            is_feasible=True,
+            shift_df=_loaded_shift_df,
+            shortages=[],
+            staff_summary_df=_restored_summary,
+            objective_value=float(_loaded_meta.get("objective_value", 0.0)),
+            solver_wall_time=float(_loaded_meta.get("solver_wall_time", 0.0)),
+        )
+        _wide = utils.build_manual_shift_wide(_loaded_shift_df, dates_df)
+        st.session_state.manual_shift_wide = _wide.copy()
+        st.session_state.manual_shift_wide_initial = _wide.copy()
+    st.session_state._pending_shift_restore = None
 
 closed_days_count_sidebar = int((~dates_df["is_business_day"]).sum())
 special_closure_count_sidebar = int(dates_df["is_special_closure"].sum())
@@ -474,31 +506,66 @@ with tab3:
     elif not result.is_feasible:
         st.error(f"求解できませんでした（ステータス: {result.status_name}）。制約設定を見直してください。")
     else:
-        st.subheader("不足アラート")
-        if result.shortages:
-            st.warning(f"{len(result.shortages)} 件の人員不足があります。")
-            weekday_by_date = dict(zip(dates_df["date"], dates_df["weekday_jp"]))
-            for s in result.shortages:
+        # 現在の「実効シフト」(手動編集があればその最新内容、なければAI結果)を
+        # まず確定させる。手動編集用ウィジェットの値はStreamlitがユーザー操作の
+        # 直後・スクリプト再実行の前に session_state へ反映するため、ここで読む
+        # 時点で既に最新の編集内容になっている(=アラートがリアルタイムに追従する)。
+        if st.session_state.manual_shift_wide is not None:
+            effective_shift_df = utils.manual_shift_wide_to_long(
+                st.session_state.manual_shift_wide, dates_df, st.session_state.staff_df
+            )
+        else:
+            effective_shift_df = result.shift_df
+        st.session_state.effective_shift_df = effective_shift_df
+
+        st.subheader("不足アラート・警告（現在のシフト状態をリアルタイム反映）")
+        st.caption(
+            "画面下の「シフト表の手動編集」での調整結果を常に最新反映します。"
+            "空欄が埋まって充足すれば該当アラートは自動的に消え、新たに不足・重複・"
+            "スキル不在が生じた場合はここに表示されます。"
+        )
+        weekday_by_date = dict(zip(dates_df["date"], dates_df["weekday_jp"]))
+        live_alerts = utils.check_manual_shift_alerts(effective_shift_df, st.session_state.staff_df, dates_df)
+        total_live_alerts = (
+            len(live_alerts["duplicates"]) + len(live_alerts["shortages"]) + len(live_alerts["skill_issues"])
+        )
+        if total_live_alerts:
+            st.warning(f"{total_live_alerts} 件のアラートがあります。")
+            for dup in live_alerts["duplicates"]:
+                d = dup["date"]
+                wd = weekday_by_date.get(d, "")
+                st.markdown(
+                    f"<span style='color:#FF0000;font-weight:bold'>⚠️ {d.month}/{d.day}({wd}): "
+                    f"{dup['name']} が複数店舗（{'、'.join(dup['stores'])}）に重複配置されています</span>",
+                    unsafe_allow_html=True,
+                )
+            for s in live_alerts["shortages"]:
                 d = s["date"]
                 wd = weekday_by_date.get(d, "")
-                label = "人員不足" if s["内容"] == "不足人数" else s["内容"]
-                st.warning(
-                    f"⚠️ {d.month}月{d.day}日({wd}) {s['store']}：{label} "
-                    f"{s['不足数']}名（{s['原因候補']}）"
-                )
-            shortage_disp = pd.DataFrame(result.shortages).copy()
-            shortage_disp["date"] = shortage_disp["date"].apply(lambda d: f"{d.month}/{d.day}")
-            shortage_disp = shortage_disp.rename(
-                columns={"date": "日付", "store": "店舗", "不足数": "不足数", "原因候補": "原因候補(休み希望)"}
-            )
-            with st.expander("不足アラートの一覧（表形式）を表示"):
-                st.dataframe(shortage_disp, width="stretch", hide_index=True)
+                st.warning(f"⚠️ {d.month}月{d.day}日({wd}) {s['store']}：人員不足（現在: {s['詳細']}）")
+            for s in live_alerts["skill_issues"]:
+                d = s["date"]
+                wd = weekday_by_date.get(d, "")
+                st.warning(f"⚠️ {d.month}月{d.day}日({wd}) {s['store']}：測定・加工スキル保有者が不在です")
         else:
-            st.success("人員不足はありません。全店舗・全日で必要体制を充足しています。")
+            st.success("人員不足・重複配置・スキル不在のいずれも検出されませんでした。")
 
-        # 手動編集がない場合のデフォルトはAI最適化結果そのもの。
-        # 手動編集がある場合は、以降の有休枠算出・Excel出力にもその内容を反映する。
-        st.session_state.effective_shift_df = result.shift_df
+        with st.expander("AI最適化直後の不足アラート（参考・当時のスナップショット）を表示"):
+            if result.status_name == "RESTORED":
+                st.caption(
+                    "このセッションはローカル保存データから復元されたため、"
+                    "最適化実行時点の詳細アラートは表示されません。上記の"
+                    "リアルタイムアラートをご確認ください。"
+                )
+            elif result.shortages:
+                shortage_disp = pd.DataFrame(result.shortages).copy()
+                shortage_disp["date"] = shortage_disp["date"].apply(lambda d: f"{d.month}/{d.day}")
+                shortage_disp = shortage_disp.rename(
+                    columns={"date": "日付", "store": "店舗", "不足数": "不足数", "原因候補": "原因候補(休み希望)"}
+                )
+                st.dataframe(shortage_disp, width="stretch", hide_index=True)
+            else:
+                st.caption("最適化実行時点では不足はありませんでした。")
 
         st.markdown("---")
         st.subheader("シフト表の手動編集（プルダウンで玉突き調整）")
@@ -545,24 +612,19 @@ with tab3:
 
             manual_shift_long = utils.manual_shift_wide_to_long(stored_wide, dates_df, st.session_state.staff_df)
             st.session_state.effective_shift_df = manual_shift_long
-            manual_alerts = utils.check_manual_shift_alerts(manual_shift_long, st.session_state.staff_df, dates_df)
+            # ↑ このセルの編集結果は次回スクリプト実行時、画面上部の
+            #   「不足アラート・警告」セクションへ即座に反映される。
 
-            if manual_alerts["duplicates"]:
-                for dup in manual_alerts["duplicates"]:
-                    d = dup["date"]
-                    st.markdown(
-                        f"<span style='color:#FF0000;font-weight:bold'>⚠️ {d.month}/{d.day}: "
-                        f"{dup['name']} が複数店舗（{'、'.join(dup['stores'])}）に重複配置されています</span>",
-                        unsafe_allow_html=True,
-                    )
-            for s in manual_alerts["shortages"]:
-                d = s["date"]
-                st.warning(f"⚠️ {d.month}/{d.day} {s['store']}：人員不足（現在: {s['詳細']}）")
-            for s in manual_alerts["skill_issues"]:
-                d = s["date"]
-                st.warning(f"⚠️ {d.month}/{d.day} {s['store']}：測定・加工スキル保有者が不在です")
-            if not (manual_alerts["duplicates"] or manual_alerts["shortages"] or manual_alerts["skill_issues"]):
-                st.success("手動編集後のシフトに問題は検出されませんでした。")
+        # 最適化直後・手動編集後・リセット後のいずれの状態も、ここで必ずローカルへ
+        # 保存する(=別ブラウザ・別端末・再起動後も直前の状態が復元される)。
+        _save_meta = {
+            "year": int(year),
+            "month": int(month),
+            "status_name": result.status_name,
+            "objective_value": float(result.objective_value),
+            "solver_wall_time": float(result.solver_wall_time),
+        }
+        utils.save_shift_result_to_disk(st.session_state.effective_shift_df, _save_meta)
 
         st.markdown("---")
         st.subheader("店舗別シフト表（AI最適化結果・参考表示）")

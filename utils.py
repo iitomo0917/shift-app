@@ -17,6 +17,7 @@ import calendar
 import colorsys
 import datetime as dt
 import io
+import json
 import os
 import re
 import unicodedata
@@ -440,6 +441,108 @@ def clear_saved_requests(path: str = SAVED_KYUKA_PATH) -> None:
     """ローカル保存済みの希望休・有休データを削除する(リセット機能用)。"""
     if os.path.exists(path):
         os.remove(path)
+
+
+# ---------------------------------------------------------------------------
+# 最適化結果・手動編集シフトのローカル永続化
+# ---------------------------------------------------------------------------
+
+LATEST_SHIFT_PATH = os.path.join(DATA_DIR, "latest_shift_result.csv")
+LATEST_SHIFT_META_PATH = os.path.join(DATA_DIR, "latest_shift_meta.json")
+
+
+def save_shift_result_to_disk(
+    shift_df: pd.DataFrame,
+    meta: dict,
+    shift_path: str = LATEST_SHIFT_PATH,
+    meta_path: str = LATEST_SHIFT_META_PATH,
+) -> None:
+    """最適化結果(または手動編集後の最新シフト)をローカルへ即時保存する。
+
+    最適化の実行完了時・手動編集の確定時・リセット時のいずれからも呼び出すことで、
+    ブラウザを閉じたり別ブラウザ/別端末からアクセスした場合でも復元できる。
+    """
+    os.makedirs(os.path.dirname(shift_path), exist_ok=True)
+    out = shift_df.copy()
+    if not out.empty:
+        out["date"] = out["date"].apply(lambda d: d.isoformat() if isinstance(d, dt.date) else d)
+    out.reindex(columns=["date", "store", "staff_id", "name", "emp_type"]).to_csv(
+        shift_path, index=False, encoding="utf-8-sig"
+    )
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False)
+
+
+def load_shift_result_from_disk(
+    shift_path: str = LATEST_SHIFT_PATH,
+    meta_path: str = LATEST_SHIFT_META_PATH,
+) -> tuple[pd.DataFrame | None, dict]:
+    """ローカル保存済みの最新シフト結果とメタ情報を読み込む。
+
+    保存ファイルが無い/壊れている場合は (None, {}) を返す(クラッシュしない)。
+    """
+    if not os.path.exists(shift_path):
+        return None, {}
+    try:
+        df = pd.read_csv(
+            shift_path,
+            dtype={"staff_id": str, "name": str, "store": str, "emp_type": str},
+            encoding="utf-8-sig",
+        )
+    except Exception:
+        return None, {}
+    if not df.empty and "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+        df = df.dropna(subset=["date"])
+    df = df.reindex(columns=["date", "store", "staff_id", "name", "emp_type"])
+
+    meta: dict = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            meta = {}
+    return df, meta
+
+
+def clear_saved_shift_result(shift_path: str = LATEST_SHIFT_PATH, meta_path: str = LATEST_SHIFT_META_PATH) -> None:
+    """ローカル保存済みの最新シフト結果を削除する。"""
+    for p in (shift_path, meta_path):
+        if os.path.exists(p):
+            os.remove(p)
+
+
+def build_simple_staff_summary(
+    shift_df: pd.DataFrame,
+    staff_df: pd.DataFrame,
+    dates_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """シフト(長形式)から、簡易版のスタッフ別サマリー(出勤日数・土日出勤・ヘルプ)を作る。
+
+    ローカル保存データから復元したセッションなど、元のソルバー内部変数(嘱託/パートの
+    稼働日数レンジ判定など)が無い場合の簡易表示用。
+    """
+    rows = []
+    for row in staff_df.itertuples():
+        sid = row.staff_id
+        work_days = shift_df[shift_df["staff_id"] == sid] if not shift_df.empty else pd.DataFrame()
+        weekend_cnt = int(work_days["date"].apply(lambda d: d.weekday() in (5, 6)).sum()) if not work_days.empty else 0
+        help_cnt = 0
+        if row.emp_type in ("店長", "正社員", "嘱託") and not work_days.empty:
+            help_cnt = int((work_days["store"] != row.home_store).sum())
+        rows.append(
+            {
+                "staff_id": sid,
+                "name": row.name,
+                "区分": row.emp_type,
+                "出勤日数": len(work_days),
+                "土日出勤日数": weekend_cnt,
+                "ヘルプ出勤日数": help_cnt,
+                "勤務日数レンジ(嘱託/パート)": "-",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
