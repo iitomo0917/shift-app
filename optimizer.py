@@ -374,6 +374,11 @@ def solve_shift(
         sid = row.staff_id
         min_days = int(row.min_workdays or 0)
         max_days = int(row.max_workdays) if pd.notna(getattr(row, "max_workdays", None)) else len(business_days)
+        # 特別休業日の追加等で営業日数が想定より少ない期間でも、レンジが物理的に
+        # 達成不可能な数値のまま残らないよう、営業日数を超えないクリップを行う
+        # (恒常的な巨大な不足数の表示や無用なペナルティの蓄積を避けるため)。
+        min_days = min(min_days, len(business_days))
+        max_days = min(max_days, len(business_days))
         total_expr = cp_model.LinearExpr.Sum(
             [_day_work_expr(work_vars, sid, d, effective_allowed[sid]) for d in business_days]
         )
@@ -398,6 +403,10 @@ def solve_shift(
         sid = row.staff_id
         role = staff_role.get(sid)
         min_days, max_days = utils.PART_ROLE_WORKDAY_RANGE.get(role, (0, len(business_days)))
+        # 特別休業日の追加等で営業日数が減っても物理的に不可能なレンジのままに
+        # ならないよう、営業日数でクリップする。
+        min_days = min(min_days, len(business_days))
+        max_days = min(max_days, len(business_days))
         total_expr = cp_model.LinearExpr.Sum(
             [_day_work_expr(work_vars, sid, d, effective_allowed[sid]) for d in business_days]
         )

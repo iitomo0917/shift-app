@@ -117,14 +117,23 @@ def is_weekend_or_holiday(d: dt.date) -> bool:
     return d.weekday() in (5, 6) or jpholiday.is_holiday(d)
 
 
-def classify_days(dates: list[dt.date]) -> pd.DataFrame:
-    """各日の曜日・定休日/特別営業/通常営業の区分を判定する。
+def classify_days(
+    dates: list[dt.date],
+    special_closure_dates: list[dt.date] | None = None,
+) -> pd.DataFrame:
+    """各日の曜日・定休日/特別営業/通常営業/特別休業日の区分を判定する。
 
     ルール:
       - 毎週水曜日: 定休日
       - 火曜日: 「その暦月の最終火曜日」のみ特別営業(10-17時)、それ以外は定休日
       - 上記以外: 通常営業(10-19時)
+      - special_closure_dates で指定された日(お盆・年末年始等の任意の全店一斉休業日)は、
+        通常なら営業日となる日を強制的に「特別休業日」として休業扱いにする
+        (=公休日数の計算式に「特別休業日数」として別枠で加算される)。
+        既に定休日の日を指定しても二重カウントはしない。
     """
+    special_set = set(special_closure_dates or [])
+
     # 期間内に登場しうる暦月それぞれの最終火曜日を事前計算
     months = sorted({(d.year, d.month) for d in dates})
     last_tue = {(y, m): last_tuesday_of_month(y, m) for y, m in months}
@@ -141,6 +150,12 @@ def classify_days(dates: list[dt.date]) -> pd.DataFrame:
                 day_type, hours, note = "定休日", "-", "火曜定休(最終火曜以外)"
         else:
             day_type, hours, note = "通常営業", NORMAL_HOURS, ""
+
+        is_special_closure = False
+        if d in special_set and day_type != "定休日":
+            day_type, hours, note = "特別休業日", "-", "特別休業(お盆・年末年始等)"
+            is_special_closure = True
+
         holiday_name = jpholiday.is_holiday_name(d) or ""
         rows.append(
             {
@@ -149,10 +164,11 @@ def classify_days(dates: list[dt.date]) -> pd.DataFrame:
                 "day_type": day_type,
                 "hours": hours,
                 "note": note,
-                "is_closed": day_type == "定休日",
-                "is_business_day": day_type != "定休日",
+                "is_closed": day_type in ("定休日", "特別休業日"),
+                "is_business_day": day_type not in ("定休日", "特別休業日"),
                 "is_weekend_or_holiday": is_weekend_or_holiday(d),
                 "holiday_name": holiday_name,
+                "is_special_closure": is_special_closure,
             }
         )
     return pd.DataFrame(rows)
@@ -1037,7 +1053,10 @@ def build_export_workbook(
     from openpyxl.utils import get_column_letter
 
     dates = list(dates_df["date"])
-    date_labels = [f"{d.month}/{d.day}({row.weekday_jp})" for d, row in zip(dates, dates_df.itertuples())]
+    date_labels = [
+        f"{d.month}/{d.day}({row.weekday_jp})" + ("\n休業" if getattr(row, "is_special_closure", False) else "")
+        for d, row in zip(dates, dates_df.itertuples())
+    ]
     n_date_cols = len(dates)
     total_cols = 1 + n_date_cols  # 列A=店舗名/見出し、以降は日付列
 
@@ -1062,12 +1081,17 @@ def build_export_workbook(
     if requests_df is not None and not requests_df.empty:
         requested_off_pairs = set(zip(requests_df["name"], requests_df["date"]))
 
-    # 日付見出し(土曜/日曜・祝日/平日)の強調配色
+    # 日付見出し(土曜/日曜・祝日/平日/特別休業日)の強調配色
     SAT_FILL, SAT_FONT = "DCE6F1", "002060"
     SUN_HOLIDAY_FILL, SUN_HOLIDAY_FONT = "FCE4D6", "C00000"
     WEEKDAY_HEADER_FILL, WEEKDAY_HEADER_FONT = "E2EFDA", "375623"
+    SPECIAL_CLOSURE_FILL, SPECIAL_CLOSURE_FONT = "BFBFBF", "404040"
+
+    special_closure_by_date = dict(zip(dates_df["date"], dates_df.get("is_special_closure", False)))
 
     def _date_header_style(d: dt.date) -> tuple[str, str]:
+        if special_closure_by_date.get(d):
+            return SPECIAL_CLOSURE_FILL, SPECIAL_CLOSURE_FONT
         if jpholiday.is_holiday(d) or d.weekday() == 6:
             return SUN_HOLIDAY_FILL, SUN_HOLIDAY_FONT
         if d.weekday() == 5:
@@ -1119,6 +1143,17 @@ def build_export_workbook(
         store_cell.border = cell_border
 
         for j, d in enumerate(dates, start=2):
+            if special_closure_by_date.get(d):
+                # 特別休業日: 全店休業のため、店舗行はグレーアウトし「休業」と表示する。
+                for r_offset in range(n_rows):
+                    row_idx = start_row + r_offset
+                    cell = ws1.cell(row=row_idx, column=j, value="休業")
+                    cell.alignment = center
+                    cell.font = Font(color=SPECIAL_CLOSURE_FONT)
+                    cell.fill = PatternFill("solid", fgColor=SPECIAL_CLOSURE_FILL)
+                    cell.border = cell_border
+                continue
+
             if shift_df.empty:
                 day_rows = pd.DataFrame(columns=["name", "emp_type"])
             else:

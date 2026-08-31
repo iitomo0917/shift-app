@@ -31,6 +31,8 @@ def init_state():
         st.session_state.solve_result = None
     if "period" not in st.session_state:
         st.session_state.period = (2026, 9)
+    if "special_closure_labels" not in st.session_state:
+        st.session_state.special_closure_labels = []
 
 
 init_state()
@@ -79,10 +81,37 @@ st.session_state.period = (year, month)
 
 period_dates = utils.get_period_dates(year, month)
 period_label = f"{year}年{month}月度 ({period_dates[0].month}/{period_dates[0].day}〜{period_dates[-1].month}/{period_dates[-1].day})"
-dates_df = utils.classify_days(period_dates)
+
+# 特別休業日(お盆・年末年始等)の選択は Tab1 のウィジェットで行うが、
+# dates_df の計算(このすぐ下)より前に値を読む必要があるため、ここでは
+# 前回までにセッションへ保存された選択値を読み出すだけにする(Streamlitの
+# ウィジェットは key を通じて session_state と自動同期されるため、この
+# パターンで安全に「後で描画するウィジェットの値を先に使う」ことができる)。
+special_closure_labels_all = [
+    f"{d.month}/{d.day}({wd})" for d, wd in zip(period_dates, [utils.WEEKDAY_JP[d.weekday()] for d in period_dates])
+]
+special_closure_label_to_date = dict(zip(special_closure_labels_all, period_dates))
+st.session_state.special_closure_labels = [
+    l for l in st.session_state.special_closure_labels if l in special_closure_label_to_date
+]
+special_closure_dates = [special_closure_label_to_date[l] for l in st.session_state.special_closure_labels]
+
+dates_df = utils.classify_days(period_dates, special_closure_dates=special_closure_dates)
 st.sidebar.markdown(f"**シフト期間:** {period_label}")
 
-base_holiday_quota = st.sidebar.number_input("店長・正社員 基準公休日数", min_value=0, max_value=31, value=9)
+closed_days_count_sidebar = int((~dates_df["is_business_day"]).sum())
+special_closure_count_sidebar = int(dates_df["is_special_closure"].sum())
+base_holiday_quota = closed_days_count_sidebar + 1
+base_workdays_sidebar = len(period_dates) - base_holiday_quota
+st.sidebar.metric(
+    "店長・正社員 基準公休日数(自動計算)",
+    f"{base_holiday_quota}日",
+    help=(
+        f"総定休日数({closed_days_count_sidebar}日 ※特別休業日{special_closure_count_sidebar}日を含む)"
+        f" ＋ 個別公休1日 = {base_holiday_quota}日。基準出勤日数は "
+        f"{len(period_dates)}日 − {base_holiday_quota}日 = {base_workdays_sidebar}日です。"
+    ),
+)
 time_limit_sec = st.sidebar.slider("最適化 計算時間上限(秒)", min_value=10, max_value=180, value=30, step=10)
 
 st.sidebar.markdown("---")
@@ -120,6 +149,20 @@ tab1, tab2, tab3, tab4 = st.tabs(
 
 # --- Tab1: カレンダー・有給可能日設定 ---------------------------------------
 with tab1:
+    st.subheader("特別休業日（臨時定休日）の設定")
+    st.caption(
+        "お盆・年末年始など、全店一斉で臨時休業とする日を指定できます。指定した日は"
+        "強制的に全スタッフ公休となり、店舗の営業枠(必要人数)も0名になります。"
+        "定休日数にカウントされ、正社員・店長の基準公休日数・基準出勤日数に"
+        "自動的に反映されます。"
+    )
+    st.multiselect(
+        "特別休業日（全店一斉休業 / お盆・年末年始等）",
+        options=special_closure_labels_all,
+        key="special_closure_labels",
+    )
+
+    st.markdown("---")
     st.subheader(f"営業日一覧 — {period_label}")
     show_df = dates_df.copy()
     show_df["date"] = show_df["date"].apply(lambda d: f"{d.month}/{d.day}")
@@ -135,10 +178,12 @@ with tab1:
     n_closed = int((~dates_df["is_business_day"]).sum())
     n_business = int(dates_df["is_business_day"].sum())
     n_short = int((dates_df["day_type"] == "特別営業(短縮)").sum())
-    c1, c2, c3 = st.columns(3)
+    n_special = int(dates_df["is_special_closure"].sum())
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("通常営業日数", n_business - n_short)
     c2.metric("特別営業(短縮)日数", n_short)
-    c3.metric("定休日数", n_closed)
+    c3.metric("定休日数(曜日定休)", n_closed - n_special)
+    c4.metric("特別休業日数", n_special)
 
     st.markdown("---")
     st.subheader("有給休暇 取得可能日・人数枠の自動算出")
