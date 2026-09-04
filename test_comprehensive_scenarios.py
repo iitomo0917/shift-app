@@ -229,7 +229,8 @@ def check_excel_export_styles(
     staff_df: pd.DataFrame,
     requests_df: pd.DataFrame,
 ) -> list[str]:
-    """Excel出力(フォント9pt・行高39pt・列幅5.4)がスタイルエラーなく反映されているか。"""
+    """Excel出力(フォント9pt・行高39pt・列幅5.4・全店舗4行構成)がスタイルエラーなく
+    反映されているか。"""
     try:
         xlsx_bytes = utils.build_export_workbook(shift_df, dates_df, staff_df, requests_df)
     except Exception as e:
@@ -242,6 +243,9 @@ def check_excel_export_styles(
 
     issues = []
     n_date_cols = len(dates_df)
+    STORE_SLOT_ROWS = 4  # 全7店舗を一律4行(1〜4枠)で出力する仕様(utils.pyと同じ値)
+    header_and_store_rows_end = 1 + STORE_SLOT_ROWS * len(utils.STORES)  # ヘッダー1行+7店舗×4行=29行目
+
     for sheet_name in ["店舗別日別シフト表", "スタッフ別出勤一覧表"]:
         if sheet_name not in wb.sheetnames:
             issues.append(f"シート「{sheet_name}」が存在しない")
@@ -254,7 +258,8 @@ def check_excel_export_styles(
         if not header_cell.font.bold:
             issues.append(f"{sheet_name}: 1行目が太字でない(既存スタイルが崩れている)")
 
-        for r in range(1, 19):
+        height_check_end = header_and_store_rows_end if sheet_name == "店舗別日別シフト表" else 18
+        for r in range(1, height_check_end + 1):
             h = ws.row_dimensions[r].height
             if h != 39.0:
                 issues.append(f"{sheet_name}: {r}行目の行高が39pt(52px相当)でない(実際{h})")
@@ -264,6 +269,24 @@ def check_excel_export_styles(
                 w = ws.column_dimensions[get_column_letter(col_idx)].width
                 if w != 5.4:
                     issues.append(f"{sheet_name}: {get_column_letter(col_idx)}列の幅が5.4(43px相当)でない(実際{w})")
+
+            # 全7店舗が一律4行(28行)構成になっているかを検証する。
+            expected_store_at_row = {}
+            row_cursor = 2
+            for store in utils.STORES:
+                expected_store_at_row[row_cursor] = store
+                row_cursor += STORE_SLOT_ROWS
+            for row, expected_store in expected_store_at_row.items():
+                actual_store = ws.cell(row=row, column=1).value
+                if actual_store != expected_store:
+                    issues.append(
+                        f"{sheet_name}: {row}行目の店舗名が想定と異なる(想定={expected_store}, 実際={actual_store})"
+                    )
+            last_row = header_and_store_rows_end
+            if row_cursor - 1 != last_row:
+                issues.append(
+                    f"{sheet_name}: 7店舗×4行の合計行数が想定と異なる(想定終端={last_row}行目, 実際={row_cursor - 1}行目)"
+                )
         else:
             for col_idx in range(3, 3 + n_date_cols):
                 w = ws.column_dimensions[get_column_letter(col_idx)].width

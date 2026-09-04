@@ -137,27 +137,32 @@ def check_individual_restrictions(result, staff_df, dates_df) -> list[str]:
 def check_wakamatsu_takeuchi_inazawa_priority(result, staff_df) -> list[str]:
     """稲沢店における若松優先配置ルールの検証。
 
-    同一営業日に若松・竹内がともに出勤している場合、「竹内が稲沢店に配置され、
-    かつ若松が稲沢店以外に配置される」組み合わせが発生していないことを確認する。
+    同一営業日に若松・竹内(または若松・真田)がともに出勤している場合、
+    「竹内(または真田)が稲沢店に配置され、かつ若松が稲沢店以外に配置される」
+    組み合わせが発生していないことを確認する。
     """
     issues = []
     name_to_id = dict(zip(staff_df["name"], staff_df["staff_id"]))
     wm_id = name_to_id.get("若松")
-    tk_id = name_to_id.get("竹内")
-    if not wm_id or not tk_id:
+    if not wm_id:
         return issues
 
     wm_rows = result.shift_df[result.shift_df["staff_id"] == wm_id]
-    tk_rows = result.shift_df[result.shift_df["staff_id"] == tk_id]
     wm_store_by_date = dict(zip(wm_rows["date"], wm_rows["store"]))
-    tk_store_by_date = dict(zip(tk_rows["date"], tk_rows["store"]))
 
-    for d, tk_store in tk_store_by_date.items():
-        if tk_store != "稲沢店":
+    for rival_name in ("竹内", "真田"):
+        rival_id = name_to_id.get(rival_name)
+        if not rival_id:
             continue
-        wm_store = wm_store_by_date.get(d)
-        if wm_store is not None and wm_store != "稲沢店":
-            issues.append(f"{d}: 竹内=稲沢店・若松={wm_store}(禁止されるべき組み合わせ)")
+        rival_rows = result.shift_df[result.shift_df["staff_id"] == rival_id]
+        rival_store_by_date = dict(zip(rival_rows["date"], rival_rows["store"]))
+
+        for d, rival_store in rival_store_by_date.items():
+            if rival_store != "稲沢店":
+                continue
+            wm_store = wm_store_by_date.get(d)
+            if wm_store is not None and wm_store != "稲沢店":
+                issues.append(f"{d}: {rival_name}=稲沢店・若松={wm_store}(禁止されるべき組み合わせ)")
 
     return issues
 

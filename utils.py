@@ -1709,8 +1709,15 @@ def build_export_workbook(
     current_row = 2
     emp_type_by_staff = dict(zip(shift_df["staff_id"], shift_df["emp_type"])) if not shift_df.empty else {}
 
+    # 「店舗別日別シフト表」シートは、実際の店舗別上限人数(STORE_MAX_HEADCOUNT、
+    # 2名または3名)に関わらず、全7店舗を一律「縦4行(1〜4枠)」で出力する
+    # (印刷・現場配布時のレイアウトを店舗間で統一するための表示上の仕様であり、
+    # ソルバー側の実際の店舗別人員上限キャップ(2名/3名)を変更するものではない)。
+    # 実人数が4名に満たない店舗・日は、余った枠が自動的に空欄になる。
+    EXCEL_STORE_SLOT_ROWS = 4
+
     for idx, store in enumerate(STORES):
-        n_rows = STORE_MAX_HEADCOUNT.get(store, 2)
+        n_rows = EXCEL_STORE_SLOT_ROWS
         start_row = current_row
         fill = store_fills[idx % 2]
 
@@ -1813,8 +1820,11 @@ def build_export_workbook(
     for j in range(34, total_cols + 1):
         ws1.column_dimensions[get_column_letter(j)].width = 13
 
-    # 1行目(ヘッダー)〜18行目の行高を 52px相当(39pt)に統一する。
-    for r in range(1, 19):
+    # 1行目(ヘッダー)〜店舗ブロック最終行(ヘッダー1行+7店舗×4枠=29行目)までの
+    # 行高を 52px相当(39pt)に統一する(店舗ブロックの行数を固定値で再計算せず、
+    # 実際に描画したEXCEL_STORE_SLOT_ROWS×STORES数から動的に導出する)。
+    header_and_store_rows_end = 1 + EXCEL_STORE_SLOT_ROWS * len(STORES)
+    for r in range(1, header_and_store_rows_end + 1):
         ws1.row_dimensions[r].height = 39.0
 
     ws1.freeze_panes = "B2"
