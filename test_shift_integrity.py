@@ -260,7 +260,13 @@ def check_leave_candidate_excludes_already_off(staff_df, dates_df) -> list[str]:
 # ---------------------------------------------------------------------------
 def check_requests_persistence() -> list[str]:
     """本番の data/saved_kyuka.csv には一切触れず、一時ディレクトリ上で検証する
-    (実運用データを誤って破壊しないため)。"""
+    (実運用データを誤って破壊しないため)。
+
+    「有休確定」は旧表記(区分名を「有給確定」に統一する前の表記)のまま
+    意図的に保存し、読み込み時に新表記「有給確定」へ正規化されることも
+    合わせて検証する(=表記変更だけで過去の確定休がハード制約から
+    外れてしまう事故が起きていないかの回帰チェック)。
+    """
     issues = []
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = os.path.join(tmp_dir, "saved_kyuka.csv")
@@ -276,6 +282,12 @@ def check_requests_persistence() -> list[str]:
             issues.append(f"保存件数(2件)と復元件数({len(loaded)}件)が一致しない")
         elif not all(isinstance(d, dt.date) for d in loaded["date"]):
             issues.append("復元後のdate列がdatetime.date型になっていない")
+        else:
+            restored_kind = loaded.loc[loaded["name"] == "尾澤", "kind"].iloc[0]
+            if restored_kind != "有給確定":
+                issues.append(f"旧表記「有休確定」が新表記「有給確定」へ正規化されていない(実際: {restored_kind})")
+            if restored_kind not in utils.HARD_OFF_KINDS:
+                issues.append("正規化後の「有給確定」がHARD_OFF_KINDSに含まれていない")
         utils.clear_saved_requests(path=tmp_path)
         if len(utils.load_requests_from_disk(path=tmp_path)) != 0:
             issues.append("クリア後も希望休データが残っている")
@@ -540,7 +552,7 @@ def check_kyuka_concurrent_requests_no_data_loss() -> list[str]:
 
         # セッションA・Bがそれぞれ別の申請を(旧方式なら競合するタイミングで)送信する。
         utils.append_kyuka_request("生駒", dt.date(2026, 9, 18), "希望休", log_path)
-        utils.append_kyuka_request("辻本", dt.date(2026, 9, 19), "有休申請", log_path)
+        utils.append_kyuka_request("辻本", dt.date(2026, 9, 19), "有給申請", log_path)
 
         pairs = set(zip(current()["name"], current()["date"]))
         if ("生駒", dt.date(2026, 9, 18)) not in pairs:
@@ -570,7 +582,7 @@ def check_kyuka_concurrent_requests_no_data_loss() -> list[str]:
         edited_long = utils.kyuka_requests_wide_to_long(wide, staff_df, dates_df)
 
         # 管理者が編集している間に、別のスタッフ(山岡)から新規申請が届いたとする。
-        utils.append_kyuka_request("山岡", dt.date(2026, 9, 20), "有休確定", log_path)
+        utils.append_kyuka_request("山岡", dt.date(2026, 9, 20), "有給確定", log_path)
         # 差分の基準は「管理者が編集を始めた時点のスナップショット」であるべきで、
         # ここで最新状態を読み直してはいけない(読み直すと山岡の新規申請が
         # 誤って取消として上書きされてしまう=まさにこのテストで検出したい不具合)。

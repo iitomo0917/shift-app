@@ -266,7 +266,7 @@ with tab1:
     st.subheader("有給休暇 取得可能日・人数枠の自動算出")
     st.caption(
         "各営業日について、全7店舗の最低運営人員(社員のみ換算)を確保した上での"
-        "「社員・嘱託の余力人数」を自動算出します。既に絶対休/有休確定が入っている"
+        "「社員・嘱託の余力人数」を自動算出します。既に絶対休/有給確定が入っている"
         "スタッフは差し引いて計算されます。"
     )
 
@@ -283,7 +283,7 @@ with tab1:
             "weekday_jp": "曜日",
             "day_type": "区分",
             "employee_headcount": "社員+嘱託 総数",
-            "already_confirmed_off": "既存の絶対休/有休確定",
+            "already_confirmed_off": "既存の絶対休/有給確定",
             "min_required_employees": "最低必要人員",
             "paid_leave_slots": "有休取得可能枠",
         }
@@ -308,7 +308,7 @@ with tab1:
         st.text_area("案内文（コピーしてご利用ください）", st.session_state["announcement_text"], height=280)
 
     st.markdown("---")
-    st.subheader("有休申請をシフトに反映（希望休一覧へ追加）")
+    st.subheader("有給申請をシフトに反映（希望休一覧へ追加）")
     slot_days = availability_df[availability_df["paid_leave_slots"] > 0]["date"].tolist()
     if slot_days:
         colA, colB, colC = st.columns([2, 2, 1])
@@ -326,8 +326,8 @@ with tab1:
             st.write("")
             st.write("")
             if st.button("追加"):
-                utils.append_kyuka_request(target_name, target_date, "有休申請", utils.kyuka_log_path_for(year, month))
-                st.success(f"{target_name} / {target_date.month}/{target_date.day} を有休申請として追加しました。")
+                utils.append_kyuka_request(target_name, target_date, "有給申請", utils.kyuka_log_path_for(year, month))
+                st.success(f"{target_name} / {target_date.month}/{target_date.day} を有給申請として追加しました。")
                 st.rerun()
     else:
         st.info("現在、有休取得可能枠のある日はありません。")
@@ -364,7 +364,7 @@ with tab2:
             key="kyuka_form_date",
         )
     with form_c3:
-        form_kind = st.selectbox("区分", options=["希望休", "有休確定", "有休申請"], key="kyuka_form_kind")
+        form_kind = st.selectbox("区分", options=utils.REQUEST_KINDS, key="kyuka_form_kind")
     with form_c4:
         st.write("")
         st.write("")
@@ -398,7 +398,7 @@ with tab2:
     # =========================================================================
     st.subheader("📋 管理者用 全体休暇マトリックス表（日別×スタッフ別）")
     st.caption(
-        "種別: 希望休(ソフト) / 絶対休(ハード=100%遵守) / 有休申請(ソフト・有休可能日で優先) / 有休確定(ハード)"
+        "種別: 希望休(ソフト) / 絶対休(ハード=100%遵守) / 有給申請(ソフト・有休可能日で優先) / 有給確定(ハード)"
         f"　※ 個別申請フォーム・CSV取込の内容は、月度ごとに独立した追記型ログ"
         f"(data/kyuka_requests_{year}_{month:02d}.csv)へ即時保存され、再起動や別ブラウザ"
         "でのアクセス時にも復元されます。2〜3ヶ月先の月度に切り替えて先行入力しても、"
@@ -422,7 +422,7 @@ with tab2:
             column_config={
                 "スタッフ名": st.column_config.TextColumn("スタッフ名", disabled=True),
                 **{
-                    col: st.column_config.SelectboxColumn(col, options=[""] + utils.REQUEST_KINDS)
+                    col: st.column_config.SelectboxColumn(col, options=[utils.BLANK_LABEL] + utils.REQUEST_KINDS)
                     for col in date_cols
                 },
             },

@@ -387,20 +387,34 @@ def derive_allowed_stores(row) -> list[str]:
 
 
 def default_requests_df() -> pd.DataFrame:
-    """希望休・有休申請の入力テーブルの空雛形。"""
+    """希望休・有給申請の入力テーブルの空雛形。"""
     return pd.DataFrame(
         {
             "staff_id": pd.Series(dtype="str"),
             "name": pd.Series(dtype="str"),
             "date": pd.Series(dtype="object"),
-            "kind": pd.Series(dtype="str"),  # 希望休 / 絶対休 / 有休申請 / 有休確定
+            "kind": pd.Series(dtype="str"),  # 希望休 / 絶対休 / 有給申請 / 有給確定
         }
     )
 
 
-REQUEST_KINDS = ["希望休", "絶対休", "有休申請", "有休確定"]
-HARD_OFF_KINDS = {"絶対休", "有休確定"}
-SOFT_OFF_KINDS = {"希望休", "有休申請"}
+REQUEST_KINDS = ["希望休", "絶対休", "有給申請", "有給確定"]
+HARD_OFF_KINDS = {"絶対休", "有給確定"}
+SOFT_OFF_KINDS = {"希望休", "有給申請"}
+
+# 旧表記(「有休」)からのデータ移行用エイリアス。過去に保存されたログ/CSVには
+# 旧表記の値がそのまま残っている可能性があるため、読み込み時に必ずこの表を
+# 通して新表記(「有給」)へ正規化する(=保存済みの絶対休/有給確定が、表記の
+# 変更だけでハード制約から外れてしまう事故を防ぐ)。
+_LEGACY_KIND_ALIASES = {
+    "有休申請": "有給申請",
+    "有休確定": "有給確定",
+}
+
+
+def _normalize_kind_value(kind: str) -> str:
+    """kind文字列を、旧表記(有休)を含めて現行の正規表記(有給)へ正規化する。"""
+    return _LEGACY_KIND_ALIASES.get(kind, kind)
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +459,10 @@ def load_requests_from_disk(path: str = SAVED_KYUKA_PATH) -> pd.DataFrame:
         return default_requests_df()
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
     df = df.dropna(subset=["date"])
-    return df.reindex(columns=["staff_id", "name", "date", "kind"]).reset_index(drop=True)
+    df = df.reindex(columns=["staff_id", "name", "date", "kind"]).reset_index(drop=True)
+    if "kind" in df.columns:
+        df["kind"] = df["kind"].apply(lambda k: _normalize_kind_value(k) if isinstance(k, str) else k)
+    return df
 
 
 def clear_saved_requests(path: str = SAVED_KYUKA_PATH) -> None:
@@ -517,7 +534,7 @@ def _release_kyuka_lock(path: str) -> None:
 
 
 def append_kyuka_request(staff_name: str, date: dt.date, request_type: str, path: str) -> None:
-    """個別の希望休・有休申請(または取消)を1件、ログCSVへ追記する。
+    """個別の希望休・有給申請(または取消)を1件、ログCSVへ追記する。
 
     既存行の読み込み・書き換えを一切行わないため、他のスタッフが同時に別の
     申請を送信していても、互いのデータを消去することがない。
@@ -572,6 +589,9 @@ def compute_current_requests_from_log(log_df: pd.DataFrame, staff_df: pd.DataFra
     df = df.dropna(subset=["date"])
     if df.empty:
         return default_requests_df()
+    # 過去に旧表記(有休申請/有休確定)で追記されたログ行も、新表記(有給)へ
+    # 正規化してから採用する(表記変更だけでハード制約から外れないようにする)。
+    df["request_type"] = df["request_type"].apply(lambda k: _normalize_kind_value(k) if isinstance(k, str) else k)
 
     # groupby(...).last() はグループ内の最終出現行(=ログ上で最も新しい申請)を採用する。
     latest = df.groupby(["staff_name", "date"], as_index=False, sort=False).last()
@@ -652,7 +672,11 @@ def build_kyuka_requests_wide(
     staff_df: pd.DataFrame,
     dates_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """現在の申請一覧(長形式)を、管理者用マトリクス表(スタッフ×日付)に変換する。"""
+    """現在の申請一覧(長形式)を、管理者用マトリクス表(スタッフ×日付)に変換する。
+
+    未申請のセルは店舗別日別シフト表の手動編集と同じ表記(BLANK_LABEL=「（空白）」)
+    で埋める(表示・編集プルダウンの選択肢を全社的に統一するため)。
+    """
     date_labels = kyuka_matrix_date_labels(dates_df)
     lookup: dict[tuple[str, dt.date], str] = {}
     if not requests_df.empty:
@@ -661,7 +685,7 @@ def build_kyuka_requests_wide(
 
     wide = pd.DataFrame({"スタッフ名": staff_df["name"].tolist()})
     for label, d in zip(date_labels, dates_df["date"]):
-        wide[label] = [lookup.get((nm, d), "") for nm in staff_df["name"]]
+        wide[label] = [lookup.get((nm, d), BLANK_LABEL) for nm in staff_df["name"]]
     return wide
 
 
@@ -801,10 +825,12 @@ _CSV_KIND_LOOKUP = {
     "希望休": "希望休",
     "休": "希望休",
     "公休": "希望休",
-    "有休": "有休確定",
-    "有給": "有休確定",
-    "有休確定": "有休確定",
-    "有休申請": "有休申請",
+    "有休": "有給確定",
+    "有給": "有給確定",
+    "有給確定": "有給確定",
+    "有休確定": "有給確定",  # 旧表記(後方互換)
+    "有給申請": "有給申請",
+    "有休申請": "有給申請",  # 旧表記(後方互換)
     "絶対休": "絶対休",
 }
 
@@ -972,7 +998,7 @@ def compute_paid_leave_availability(
     """営業日ごとに「有給取得可能人数枠（社員・嘱託向け）」を自動算出する。
 
     考え方:
-      その日の「社員(店長+正社員+嘱託)」の頭数のうち、既に絶対休/有休確定で
+      その日の「社員(店長+正社員+嘱託)」の頭数のうち、既に絶対休/有給確定で
       抜けている人数を除いた「稼働可能人数」から、全店運営に最低限必要な
       人数(min_required_employee_bodies_per_day)を差し引いた余力を、
       その日に新規で有休を割り当てられる人数枠とみなす。
@@ -1072,7 +1098,7 @@ def _min_required_employees_for_store(
 
 
 _LEAVE_REMOVABLE_TYPES = ("店長", "正社員")  # このロジックで「休みに回す」候補となる区分
-# 代替要員(ヘルプ投入)となりうる区分。店長・正社員は全員21日出勤(有休確定者は20日)で
+# 代替要員(ヘルプ投入)となりうる区分。店長・正社員は全員21日出勤(有給確定者は20日)で
 # 固定されており、代替に回すとその分だけ出勤日数が規定を超えてしまうため、
 # 代替候補には絶対に含めない(嘱託・パートのみが対象)。
 _LEAVE_SUBSTITUTE_TYPES = ("嘱託", "パート")
@@ -1092,7 +1118,7 @@ def compute_post_solve_leave_availability(
       ケース2(代替による創出): ちょうど最低人数で足りている場合でも、
         「実際にその日その店舗へ出勤しているスタッフ」の中から店長・正社員を
         1名「休み」に置き換えたと仮定し、その日どこにも出勤しておらず、かつ
-        希望休・絶対休・有休申請・有休確定のいずれも入っていない(=そもそも
+        希望休・絶対休・有給申請・有給確定のいずれも入っていない(=そもそも
         休みたいわけではない)正社員/嘱託の中から
           - この店舗への勤務が許可されている(曜日限定の禁止ルールも含む)
           - 嘱託の場合は月間上限日数にまだ余裕がある
@@ -1132,7 +1158,7 @@ def compute_post_solve_leave_availability(
     staff_sat_sun_forbidden = dict(zip(staff_df["staff_id"], staff_df.get("saturday_sunday_forbidden_stores")))
     name_to_id = dict(zip(staff_df["name"], staff_df["staff_id"]))
 
-    # 希望休・絶対休・有休申請・有休確定のいずれかが入っている(staff_id, date)の集合。
+    # 希望休・絶対休・有給申請・有給確定のいずれかが入っている(staff_id, date)の集合。
     # このいずれかに該当するスタッフは、そもそも休みたい/休みが確定しているため、
     # 代替要員として「呼び出す」候補には絶対にしない。
     requested_off_pairs: set[tuple[str, dt.date]] = set()
@@ -1271,7 +1297,7 @@ def compute_post_solve_leave_availability(
                     if not _is_idle(csid, d):
                         continue
                     if (csid, d) in requested_off_pairs:
-                        continue  # 希望休/絶対休/有休申請/有休確定が入っている人は呼び出さない
+                        continue  # 希望休/絶対休/有給申請/有給確定が入っている人は呼び出さない
                     if not _has_day_capacity(csid):
                         continue
                     if has_skill and remaining_skilled == 0 and not bool(staff_has_skill.get(csid)):
@@ -1594,7 +1620,7 @@ def build_export_workbook(
 
     「店舗別日別シフト表」は現場配布・掲示にそのまま使えるよう、1セルに1名のみを
     配置する縦分割レイアウトとし、下段に休日スタッフ一覧(赤文字)を付す。
-    休日スタッフのうち、希望休・絶対休・有休申請・有休確定のいずれかを本人が
+    休日スタッフのうち、希望休・絶対休・有給申請・有給確定のいずれかを本人が
     申請していた場合は赤文字＋太字とし、AIが自動割り当てした公休(通常の赤文字)
     と一目で区別できるようにする。
     """
@@ -1628,7 +1654,7 @@ def build_export_workbook(
     red_bold_font = Font(color="FF0000", bold=True)
     requested_off_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
-    # 希望休/絶対休/有休申請/有休確定のいずれかを本人が申請していた(氏名,日付)の集合。
+    # 希望休/絶対休/有給申請/有給確定のいずれかを本人が申請していた(氏名,日付)の集合。
     # 該当する休日スタッフ名は赤文字＋太字にして、AI自動割り当ての公休と区別する。
     requested_off_pairs: set[tuple[str, dt.date]] = set()
     if requests_df is not None and not requests_df.empty:
