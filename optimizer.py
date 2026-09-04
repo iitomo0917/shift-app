@@ -73,6 +73,28 @@ def _day_work_expr(work_vars, sid, d, allowed_stores):
     return cp_model.LinearExpr.Sum(terms) if terms else 0
 
 
+def _forbid_full_fallback_when_understaffed(model, e_expr, fallback_exprs: list, key: str) -> None:
+    """土日祝に「社員2名未満」かつ「規定のパート全員が揃う」という、名指しで
+    禁止された組み合わせ(例: 徳重店の社員1名+パートB+パートCの3名体制、
+    名古屋中川店・天白植田店の社員1名+規定パート1名の2名体制)が、社員側の
+    不足スラックだけを介して実質的に成立してしまう抜け道を塞ぐ。
+
+    呼び出し元では、この組み合わせを避けるために combo という真偽値変数を
+    combo==0(=社員2名以上を要求)に固定しているが、combo は combo==1 の
+    方向にしか実際の人員配置を拘束しない。そのため combo==0 に固定しただけ
+    では、社員側の不足をスラック変数(不足アラート)で許容しつつ、パート側は
+    禁止パターンのまま配置されてしまう抜け道が残る。この関数は、社員が
+    2名に満たない場合は fallback_exprs(禁止パターンを構成するパート側の
+    出勤有無)が全員同時には揃わない、というハード制約を追加で課すことで、
+    禁止パターンそのものの発生を構造的に防ぐ(fallback_exprsが1要素のみの
+    場合は「社員2名未満ならそのパートは出勤不可」という意味になる)。
+    """
+    two_or_more = model.NewBoolVar(f"two_or_more_{key}")
+    model.Add(e_expr >= 2).OnlyEnforceIf(two_or_more)
+    model.Add(e_expr <= 1).OnlyEnforceIf(two_or_more.Not())
+    model.Add(sum(fallback_exprs) <= len(fallback_exprs) - 1).OnlyEnforceIf(two_or_more.Not())
+
+
 def solve_shift(
     dates_df: pd.DataFrame,
     staff_df: pd.DataFrame,
@@ -284,6 +306,7 @@ def solve_shift(
                         # 土日祝は「社員1名+パート柴田」の2名体制を禁止し、
                         # 必ず社員2名以上(2名 or 2名+柴田の3名)とする(ハード制約)。
                         model.Add(combo == 0)
+                        _forbid_full_fallback_when_understaffed(model, e_expr, [p_expr], f"{store}_{d}")
                     else:
                         # 平日は3名体制を完全禁止し、必ず2名体制のみとする(ハード制約)。
                         model.Add(e_expr + p_expr <= 2)
@@ -293,6 +316,7 @@ def solve_shift(
                         # 以上(2名 or 2名+尾澤の3名)とする(ハード制約)。平日は従来通り
                         # 社員1名+パート尾澤の2名体制も許可する。
                         model.Add(combo == 0)
+                        _forbid_full_fallback_when_understaffed(model, e_expr, [p_expr], f"{store}_{d}")
 
                 sf_e2 = model.NewIntVar(0, 2, f"sf_{store}_{d}_e2")
                 sf_e1 = model.NewIntVar(0, 1, f"sf_{store}_{d}_e1")
@@ -341,6 +365,7 @@ def solve_shift(
                     # 必ず社員2名以上とする(ハード制約)。社員2名+パート1名の
                     # 3名体制(パターン②の亜種)は禁止対象外のため許可される。
                     model.Add(combo == 0)
+                    _forbid_full_fallback_when_understaffed(model, e_expr, [b_expr, c_expr], f"{store}_{d}")
                 sf_e2 = model.NewIntVar(0, 2, f"sf_{store}_{d}_e2")
                 sf_e1 = model.NewIntVar(0, 1, f"sf_{store}_{d}_e1")
                 sf_b = model.NewIntVar(0, 1, f"sf_{store}_{d}_b")
