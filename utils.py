@@ -1375,11 +1375,14 @@ def build_export_workbook(
     ws1 = wb.active
     ws1.title = "店舗別日別シフト表"
 
+    # 1行目(ヘッダー行)のフォントサイズ。太字・中央揃えは従来通り維持する。
+    HEADER_FONT_SIZE = 9
+
     thin = Side(style="thin", color="BFBFBF")
     thick = Side(style="medium", color="404040")
     cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
     header_fill = PatternFill("solid", fgColor="305496")
-    header_font = Font(color="FFFFFF", bold=True)
+    header_font = Font(color="FFFFFF", bold=True, size=HEADER_FONT_SIZE)
     store_fills = [PatternFill("solid", fgColor="EDEDED"), PatternFill("solid", fgColor="FFFFFF")]
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     red_font = Font(color="FF0000")
@@ -1423,7 +1426,7 @@ def build_export_workbook(
     for j, (label, d) in enumerate(zip(date_labels, dates), start=2):
         fill_hex, font_hex = _date_header_style(d)
         c = ws1.cell(row=1, column=j, value=label)
-        c.font = Font(color=font_hex, bold=True)
+        c.font = Font(color=font_hex, bold=True, size=HEADER_FONT_SIZE)
         c.fill = PatternFill("solid", fgColor=fill_hex)
         c.alignment = center
         c.border = cell_border
@@ -1536,10 +1539,18 @@ def build_export_workbook(
     for r_offset in range(max_off):
         ws1.cell(row=off_start_row + r_offset, column=1).border = cell_border
 
-    # --- 列幅・印刷設定 -------------------------------------------------------
+    # --- 列幅・行高・印刷設定 ---------------------------------------------------
     ws1.column_dimensions[get_column_letter(1)].width = 16
-    for j in range(2, total_cols + 1):
+    # B列(2列目)〜AG列(33列目)は日別の各列として一律 43px相当(幅5.4)に統一する。
+    # 実データが33列に満たない月でも、テンプレートとしてAG列まで幅を揃えておく。
+    for j in range(2, 34):
+        ws1.column_dimensions[get_column_letter(j)].width = 5.4
+    for j in range(34, total_cols + 1):
         ws1.column_dimensions[get_column_letter(j)].width = 13
+
+    # 1行目(ヘッダー)〜18行目の行高を 52px相当(39pt)に統一する。
+    for r in range(1, 19):
+        ws1.row_dimensions[r].height = 39.0
 
     ws1.freeze_panes = "B2"
     ws1.page_setup.orientation = "landscape"
@@ -1558,7 +1569,7 @@ def build_export_workbook(
         c.border = cell_border
         if 3 <= j <= 2 + n_date_cols:
             fill_hex, font_hex = _date_header_style(dates[j - 3])
-            c.font = Font(color=font_hex, bold=True)
+            c.font = Font(color=font_hex, bold=True, size=HEADER_FONT_SIZE)
             c.fill = PatternFill("solid", fgColor=fill_hex)
         else:
             c.font = header_font
@@ -1595,9 +1606,15 @@ def build_export_workbook(
 
     ws2.column_dimensions[get_column_letter(1)].width = 12
     ws2.column_dimensions[get_column_letter(2)].width = 8
+    # 日別の各列(C列以降、店舗別日別シフト表のB〜AG列に相当)は同じく幅5.4に統一する。
     for j in range(3, 3 + n_date_cols):
-        ws2.column_dimensions[get_column_letter(j)].width = 10
+        ws2.column_dimensions[get_column_letter(j)].width = 5.4
     ws2.column_dimensions[get_column_letter(3 + n_date_cols)].width = 10
+
+    # 1行目(ヘッダー)〜18行目の行高を 52px相当(39pt)に統一する。
+    for r in range(1, 19):
+        ws2.row_dimensions[r].height = 39.0
+
     ws2.freeze_panes = "C2"
     ws2.page_setup.orientation = "landscape"
     ws2.page_setup.paperSize = ws2.PAPERSIZE_A3
