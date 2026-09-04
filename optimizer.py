@@ -202,6 +202,32 @@ def solve_shift(
                 if (sid, d, store) in work_vars:
                     model.Add(work_vars[(sid, d, store)] == 0)
 
+    # --- 4e. 稲沢店における若松・竹内の優先度制御(ハード制約) --------------------
+    #     同一営業日に若松・竹内がともに出勤する場合、「竹内を稲沢店に配置し、
+    #     かつ若松を稲沢店以外に配置する」という組み合わせを禁止する。
+    #     これにより、若松が出勤する日に竹内が稲沢店へ入るなら若松も稲沢店に
+    #     入らざるを得なくなる(=事実上、若松が稲沢店へ優先配置され、竹内は
+    #     他店舗へ回る)。どちらか一方が休みの日は該当項が自動的に0になるため、
+    #     制約は実質的に無効化され、既存の若松の土日祝配置禁止(4b)・純粋な
+    #     土日の稲沢店配置禁止(4c)・竹内のスキル/移動可能店舗制約とも矛盾なく
+    #     共存する(いずれも変数への追加の禁止であり、==1のような強制ではない
+    #     ため、既存のFEASIBLE解の探索可能性を損なわない)。
+    sid_wakamatsu = name_to_id.get("若松")
+    sid_takeuchi = name_to_id.get("竹内")
+    if sid_wakamatsu and sid_takeuchi:
+        for d in business_days:
+            takeuchi_inazawa = work_vars.get((sid_takeuchi, d, "稲沢店"))
+            if takeuchi_inazawa is None:
+                continue
+            wakamatsu_other_terms = [
+                work_vars[(sid_wakamatsu, d, st)]
+                for st in effective_allowed[sid_wakamatsu]
+                if st != "稲沢店" and (sid_wakamatsu, d, st) in work_vars
+            ]
+            if not wakamatsu_other_terms:
+                continue
+            model.Add(takeuchi_inazawa + cp_model.LinearExpr.Sum(wakamatsu_other_terms) <= 1)
+
     # --- 5. 最大6連勤(7日ウィンドウの合計<=6) --------------------------------
     for row in staff_df.itertuples():
         sid = row.staff_id

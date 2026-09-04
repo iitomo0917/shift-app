@@ -134,6 +134,34 @@ def check_individual_restrictions(result, staff_df, dates_df) -> list[str]:
     return issues
 
 
+def check_wakamatsu_takeuchi_inazawa_priority(result, staff_df) -> list[str]:
+    """稲沢店における若松優先配置ルールの検証。
+
+    同一営業日に若松・竹内がともに出勤している場合、「竹内が稲沢店に配置され、
+    かつ若松が稲沢店以外に配置される」組み合わせが発生していないことを確認する。
+    """
+    issues = []
+    name_to_id = dict(zip(staff_df["name"], staff_df["staff_id"]))
+    wm_id = name_to_id.get("若松")
+    tk_id = name_to_id.get("竹内")
+    if not wm_id or not tk_id:
+        return issues
+
+    wm_rows = result.shift_df[result.shift_df["staff_id"] == wm_id]
+    tk_rows = result.shift_df[result.shift_df["staff_id"] == tk_id]
+    wm_store_by_date = dict(zip(wm_rows["date"], wm_rows["store"]))
+    tk_store_by_date = dict(zip(tk_rows["date"], tk_rows["store"]))
+
+    for d, tk_store in tk_store_by_date.items():
+        if tk_store != "稲沢店":
+            continue
+        wm_store = wm_store_by_date.get(d)
+        if wm_store is not None and wm_store != "稲沢店":
+            issues.append(f"{d}: 竹内=稲沢店・若松={wm_store}(禁止されるべき組み合わせ)")
+
+    return issues
+
+
 def check_day_ranges(result, staff_df) -> list[str]:
     """嘱託・パートの契約勤務日数レンジは utils.py の設定値(単一の真実の情報源)と
     照合する(要件文中の数値を再度ハードコードしない。値そのものの妥当性が別途
@@ -514,6 +542,10 @@ def main():
 
     record("3a. 個別スタッフの勤務制限(若松/若林/中村)", check_individual_restrictions(result, staff_df, dates_df))
     record("3b. 嘱託・パートの契約勤務日数レンジ", check_day_ranges(result, staff_df))
+    record(
+        "3c. 稲沢店における若松優先配置(竹内=稲沢+若松=他店の禁止)",
+        check_wakamatsu_takeuchi_inazawa_priority(result, staff_df),
+    )
 
     record(
         "4a. 有休代替候補の妥当性(正社員除外/上限未到達)",
