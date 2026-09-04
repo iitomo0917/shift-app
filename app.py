@@ -81,19 +81,6 @@ def recompute_allowed_stores(staff_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _admin_passcode() -> str:
-    """希望休・有休マトリクス表を直接編集できる管理者パスコード。
-
-    運用時は `.streamlit/secrets.toml` に `admin_passcode = "..."` を設定して
-    デフォルト値から必ず変更すること(secretsが未設定の環境でも動作するよう
-    フォールバック値を用意している)。
-    """
-    try:
-        return str(st.secrets.get("admin_passcode", "shift-admin"))
-    except Exception:
-        return "shift-admin"
-
-
 # ---------------------------------------------------------------------------
 # サイドバー
 # ---------------------------------------------------------------------------
@@ -418,9 +405,8 @@ with tab2:
         "他の月度のデータとは混ざりません。"
     )
     st.caption(
-        "この表は個別申請フォームからの入力を自動集計したものです。閲覧は誰でも可能ですが、"
-        "セルを直接書き換えられるのは管理者パスコードを入力した場合のみです。"
-        "(パスコードは .streamlit/secrets.toml の admin_passcode で設定してください)"
+        "この表は個別申請フォームからの入力を自動集計したものです。"
+        "「管理者モードで編集する」をONにすると、セルを直接書き換えられます。"
     )
 
     current_requests_df = st.session_state.requests_df
@@ -431,44 +417,37 @@ with tab2:
     if not admin_mode:
         st.dataframe(wide_matrix, width="stretch", height=400, hide_index=True)
     else:
-        admin_passcode_input = st.text_input("管理者パスコード", type="password", key="kyuka_admin_passcode")
-        if admin_passcode_input != _admin_passcode():
-            if admin_passcode_input:
-                st.error("パスコードが違います。")
-            st.dataframe(wide_matrix, width="stretch", height=400, hide_index=True)
-        else:
-            st.success("管理者モードが有効です。セルを直接編集して保存できます。")
-            edited_matrix = st.data_editor(
-                wide_matrix,
-                column_config={
-                    "スタッフ名": st.column_config.TextColumn("スタッフ名", disabled=True),
-                    **{
-                        col: st.column_config.SelectboxColumn(col, options=[""] + utils.REQUEST_KINDS)
-                        for col in date_cols
-                    },
+        edited_matrix = st.data_editor(
+            wide_matrix,
+            column_config={
+                "スタッフ名": st.column_config.TextColumn("スタッフ名", disabled=True),
+                **{
+                    col: st.column_config.SelectboxColumn(col, options=[""] + utils.REQUEST_KINDS)
+                    for col in date_cols
                 },
-                hide_index=True,
-                width="stretch",
-                height=400,
-                key="kyuka_admin_matrix_editor",
-            )
-            if st.button("💾 管理者による変更を保存", key="kyuka_admin_matrix_save"):
-                edited_long = utils.kyuka_requests_wide_to_long(edited_matrix, st.session_state.staff_df, dates_df)
-                # 差分の基準は、このマトリクス表を描画した時点のスナップショット
-                # (wide_matrixの元になったcurrent_requests_df)にする。ここで改めて
-                # ディスクを読み直すと、管理者が編集していた間に他のスタッフが送信
-                # した個別申請が「管理者が消した差分」と誤認識され、巻き込んで
-                # 消えてしまうため、あえて読み直さない。実際に値が変化したセルの
-                # 分だけが差分追記される。
-                utils.sync_admin_requests_edit(current_requests_df, edited_long, kyuka_log_path)
-                st.success("マトリクス表の変更を保存しました。")
-                st.rerun()
+            },
+            hide_index=True,
+            width="stretch",
+            height=400,
+            key="kyuka_admin_matrix_editor",
+        )
+        if st.button("💾 管理者による変更を保存", key="kyuka_admin_matrix_save"):
+            edited_long = utils.kyuka_requests_wide_to_long(edited_matrix, st.session_state.staff_df, dates_df)
+            # 差分の基準は、このマトリクス表を描画した時点のスナップショット
+            # (wide_matrixの元になったcurrent_requests_df)にする。ここで改めて
+            # ディスクを読み直すと、管理者が編集していた間に他のスタッフが送信
+            # した個別申請が「管理者が消した差分」と誤認識され、巻き込んで
+            # 消えてしまうため、あえて読み直さない。実際に値が変化したセルの
+            # 分だけが差分追記される。
+            utils.sync_admin_requests_edit(current_requests_df, edited_long, kyuka_log_path)
+            st.success("マトリクス表の変更を保存しました。")
+            st.rerun()
 
-            st.markdown("---")
-            if st.button("🗑️ 休暇データをリセット（この月度のみ・管理者操作）", key="reset_requests_button"):
-                utils.clear_kyuka_log(kyuka_log_path)
-                st.success(f"{period_label}の希望休・有休データをリセットしました。")
-                st.rerun()
+        st.markdown("---")
+        if st.button("🗑️ 休暇データをリセット（この月度のみ・管理者操作）", key="reset_requests_button"):
+            utils.clear_kyuka_log(kyuka_log_path)
+            st.success(f"{period_label}の希望休・有休データをリセットしました。")
+            st.rerun()
 
     st.divider()
 
