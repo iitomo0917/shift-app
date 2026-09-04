@@ -7,8 +7,6 @@ Streamlit + Google OR-Tools (CP-SAT)
 
 from __future__ import annotations
 
-import datetime as dt
-
 import pandas as pd
 import streamlit as st
 
@@ -81,6 +79,19 @@ def recompute_allowed_stores(staff_df: pd.DataFrame) -> pd.DataFrame:
     df["home_store"] = df.apply(_fix_home_store, axis=1)
     df["allowed_stores"] = df.apply(utils.derive_allowed_stores, axis=1)
     return df
+
+
+def _admin_passcode() -> str:
+    """希望休・有休マトリクス表を直接編集できる管理者パスコード。
+
+    運用時は `.streamlit/secrets.toml` に `admin_passcode = "..."` を設定して
+    デフォルト値から必ず変更すること(secretsが未設定の環境でも動作するよう
+    フォールバック値を用意している)。
+    """
+    try:
+        return str(st.secrets.get("admin_passcode", "shift-admin"))
+    except Exception:
+        return "shift-admin"
 
 
 # ---------------------------------------------------------------------------
@@ -161,13 +172,13 @@ if st.session_state.solve_result is None and st.session_state.get("_pending_shif
         st.session_state.manual_shift_wide_initial = _wide.copy()
     st.session_state._pending_shift_restore = None
 
-# 希望休・有休データは月度ごとに完全に独立したファイルで管理する。対象月度が
-# 変わったら、その月度専用の保存ファイルを読み込み直す(無ければ空の雛形)。
-# 2〜3ヶ月先の月度に切り替えて先行入力・保存しても、他の月度のデータと
-# 混ざったり上書きされたりしない。
-if st.session_state.get("requests_df_period") != (year, month):
-    st.session_state.requests_df = utils.load_requests_from_disk(path=utils.saved_kyuka_path_for(year, month))
-    st.session_state.requests_df_period = (year, month)
+# 希望休・有休データは月度ごとに完全に独立した「追記型ログ」で管理する(タブ2参照)。
+# 全スタッフ分のテーブルをまるごと1ファイルへ上書き保存していた旧方式は、
+# 別ブラウザ/別端末からの同時申請と衝突すると互いのデータを消してしまう恐れが
+# あったため廃止した。ここでは画面の再実行のたびに必ずログから最新状態を
+# 再構築するため、他のスタッフが直前に送信した申請も常に反映される。
+st.session_state.requests_df = utils.load_current_requests(year, month, st.session_state.staff_df)
+st.session_state.requests_df_period = (year, month)
 
 closed_days_count_sidebar = int((~dates_df["is_business_day"]).sum())
 special_closure_count_sidebar = int(dates_df["is_special_closure"].sum())
@@ -328,18 +339,64 @@ with tab1:
             st.write("")
             st.write("")
             if st.button("追加"):
-                sid = staff_df_current.loc[staff_df_current["name"] == target_name, "staff_id"].iloc[0]
-                new_row = {"staff_id": sid, "name": target_name, "date": target_date, "kind": "有休申請"}
-                st.session_state.requests_df = pd.concat(
-                    [st.session_state.requests_df, pd.DataFrame([new_row])], ignore_index=True
-                )
+                utils.append_kyuka_request(target_name, target_date, "有休申請", utils.kyuka_log_path_for(year, month))
                 st.success(f"{target_name} / {target_date.month}/{target_date.day} を有休申請として追加しました。")
+                st.rerun()
     else:
         st.info("現在、有休取得可能枠のある日はありません。")
 
 
 # --- Tab2: スタッフ・希望休設定 ---------------------------------------------
 with tab2:
+    kyuka_log_path = utils.kyuka_log_path_for(year, month)
+
+    st.subheader("📝 希望休・有休 個別申請フォーム")
+    st.caption(
+        "スタッフご本人がスマホ・店舗PCから入力してください。1件ごとに即時追記保存されるため、"
+        "他のスタッフが同時刻に別の申請を送信していても、互いの入力内容が消えることはありません。"
+    )
+
+    name_options_form = st.session_state.staff_df["name"].tolist()
+
+    form_c1, form_c2, form_c3, form_c4 = st.columns([2, 2, 2, 1.3])
+    with form_c1:
+        form_name = st.selectbox("スタッフ名", options=name_options_form, key="kyuka_form_name")
+    with form_c2:
+        form_date = st.selectbox(
+            "対象日付",
+            options=period_dates,
+            format_func=lambda d: f"{d.month}/{d.day}({utils.WEEKDAY_JP[d.weekday()]})",
+            key="kyuka_form_date",
+        )
+    with form_c3:
+        form_kind = st.selectbox("区分", options=["希望休", "有休確定", "有休申請"], key="kyuka_form_kind")
+    with form_c4:
+        st.write("")
+        st.write("")
+        if st.button("💾 申請を保存", key="kyuka_form_submit", width="stretch"):
+            utils.append_kyuka_request(form_name, form_date, form_kind, kyuka_log_path)
+            st.success(f"{form_name} / {form_date.month}/{form_date.day} を「{form_kind}」として保存しました。")
+            st.rerun()
+
+    st.markdown(f"##### {form_name} さんの現在の申請中リスト")
+    my_requests = (
+        st.session_state.requests_df[st.session_state.requests_df["name"] == form_name]
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+    if my_requests.empty:
+        st.info("現在申請中のデータはありません。")
+    else:
+        for _, r in my_requests.iterrows():
+            lc1, lc2, lc3 = st.columns([2, 3, 1.3])
+            lc1.write(f"{r['date'].month}/{r['date'].day}({utils.WEEKDAY_JP[r['date'].weekday()]})")
+            lc2.write(r["kind"])
+            cancel_key = f"kyuka_cancel_{r['staff_id']}_{r['date'].isoformat()}"
+            if lc3.button("取消", key=cancel_key):
+                utils.append_kyuka_request(r["name"], r["date"], utils.CANCELLED_REQUEST_TYPE, kyuka_log_path)
+                st.rerun()
+
+    st.markdown("---")
     st.subheader("希望休・有休 CSV一括インポート")
     st.caption(
         "「スタッフ名, 日付, 種別」の縦持ち3列形式、または「スタッフ名×日付」の"
@@ -381,15 +438,24 @@ with tab2:
             if new_rows_df.empty:
                 st.error("有効な希望休・有休データを1件も読み取れませんでした。CSVの内容をご確認ください。")
             else:
-                existing = st.session_state.requests_df
+                # 差分の基準は、この画面描画の冒頭で読み込んだ最新状態
+                # (=このスクリプト実行の中で改めて読み直したものではない)。
+                # ここで再度ディスクを読み直すと、この処理の実行中に他の
+                # スタッフが送信した個別申請まで「取り込みで消えた差分」と
+                # 誤認識され、巻き込んで消してしまうため、あえて読み直さない。
+                fresh_current = st.session_state.requests_df
                 if clear_first:
-                    existing = existing.iloc[0:0]
-                elif not existing.empty:
-                    new_keys = set(zip(new_rows_df["staff_id"], new_rows_df["date"]))
-                    keep_mask = ~existing.apply(lambda r: (r["staff_id"], r["date"]) in new_keys, axis=1)
-                    existing = existing[keep_mask]
-                st.session_state.requests_df = pd.concat([existing, new_rows_df], ignore_index=True)
+                    target_df = new_rows_df
+                else:
+                    existing = fresh_current
+                    if not existing.empty:
+                        new_keys = set(zip(new_rows_df["name"], new_rows_df["date"]))
+                        keep_mask = ~existing.apply(lambda r: (r["name"], r["date"]) in new_keys, axis=1)
+                        existing = existing[keep_mask]
+                    target_df = pd.concat([existing, new_rows_df], ignore_index=True)
+                utils.sync_admin_requests_edit(fresh_current, target_df, kyuka_log_path)
                 st.success(f"{len(new_rows_df)} 件の希望休・有休データを取り込みました。")
+                st.rerun()
 
     st.markdown("---")
     st.subheader("スタッフマスタ")
@@ -494,50 +560,66 @@ with tab2:
     st.session_state.staff_df = recompute_allowed_stores(merged)
 
     st.markdown("---")
-    st.subheader("希望休・有休 入力テーブル")
+    st.subheader("🔒 管理者用：全体マトリクス表（日別×スタッフ別）")
     st.caption(
         "種別: 希望休(ソフト) / 絶対休(ハード=100%遵守) / 有休申請(ソフト・有休可能日で優先) / 有休確定(ハード)"
-        f"　※ 手入力・編集内容は月度ごとに独立したファイル(data/saved_kyuka_{year}_{month:02d}.csv)へ"
-        "即時自動保存され、再起動や別ブラウザでのアクセス時にも復元されます。"
-        "2〜3ヶ月先の月度に切り替えて先行入力しても、他の月度のデータとは混ざりません。"
+        f"　※ 個別申請フォーム・CSV取込の内容は、月度ごとに独立した追記型ログ"
+        f"(data/kyuka_requests_{year}_{month:02d}.csv)へ即時保存され、再起動や別ブラウザ"
+        "でのアクセス時にも復元されます。2〜3ヶ月先の月度に切り替えて先行入力しても、"
+        "他の月度のデータとは混ざりません。"
+    )
+    st.caption(
+        "この表は個別申請フォームからの入力を自動集計したものです。閲覧は誰でも可能ですが、"
+        "セルを直接書き換えられるのは管理者パスコードを入力した場合のみです。"
+        "(パスコードは .streamlit/secrets.toml の admin_passcode で設定してください)"
     )
 
-    if st.button("🗑️ 休暇データをリセット（この月度のみ）", key="reset_requests_button"):
-        utils.clear_saved_requests(path=utils.saved_kyuka_path_for(year, month))
-        st.session_state.requests_df = utils.default_requests_df()
-        st.success(f"{period_label}の希望休・有休データをリセットしました。")
-        st.rerun()
+    current_requests_df = st.session_state.requests_df
+    wide_matrix = utils.build_kyuka_requests_wide(current_requests_df, st.session_state.staff_df, dates_df)
+    date_cols = [c for c in wide_matrix.columns if c != "スタッフ名"]
 
-    req_df = st.session_state.requests_df.copy()
-    if req_df.empty:
-        req_df = pd.DataFrame(
-            {"staff_id": [None], "name": [None], "date": [period_dates[0]], "kind": ["希望休"]}
-        )
+    admin_mode = st.checkbox("管理者モードで編集する", key="kyuka_admin_mode")
+    if not admin_mode:
+        st.dataframe(wide_matrix, width="stretch", height=400, hide_index=True)
+    else:
+        admin_passcode_input = st.text_input("管理者パスコード", type="password", key="kyuka_admin_passcode")
+        if admin_passcode_input != _admin_passcode():
+            if admin_passcode_input:
+                st.error("パスコードが違います。")
+            st.dataframe(wide_matrix, width="stretch", height=400, hide_index=True)
+        else:
+            st.success("管理者モードが有効です。セルを直接編集して保存できます。")
+            edited_matrix = st.data_editor(
+                wide_matrix,
+                column_config={
+                    "スタッフ名": st.column_config.TextColumn("スタッフ名", disabled=True),
+                    **{
+                        col: st.column_config.SelectboxColumn(col, options=[""] + utils.REQUEST_KINDS)
+                        for col in date_cols
+                    },
+                },
+                hide_index=True,
+                width="stretch",
+                height=400,
+                key="kyuka_admin_matrix_editor",
+            )
+            if st.button("💾 管理者による変更を保存", key="kyuka_admin_matrix_save"):
+                edited_long = utils.kyuka_requests_wide_to_long(edited_matrix, st.session_state.staff_df, dates_df)
+                # 差分の基準は、このマトリクス表を描画した時点のスナップショット
+                # (wide_matrixの元になったcurrent_requests_df)にする。ここで改めて
+                # ディスクを読み直すと、管理者が編集していた間に他のスタッフが送信
+                # した個別申請が「管理者が消した差分」と誤認識され、巻き込んで
+                # 消えてしまうため、あえて読み直さない。実際に値が変化したセルの
+                # 分だけが差分追記される。
+                utils.sync_admin_requests_edit(current_requests_df, edited_long, kyuka_log_path)
+                st.success("マトリクス表の変更を保存しました。")
+                st.rerun()
 
-    name_options = st.session_state.staff_df["name"].tolist()
-    id_by_name = dict(zip(st.session_state.staff_df["name"], st.session_state.staff_df["staff_id"]))
-
-    req_edited = st.data_editor(
-        req_df[["name", "date", "kind"]],
-        column_config={
-            "name": st.column_config.SelectboxColumn("スタッフ", options=name_options),
-            "date": st.column_config.DateColumn(
-                "日付", min_value=period_dates[0], max_value=period_dates[-1], format="YYYY-MM-DD"
-            ),
-            "kind": st.column_config.SelectboxColumn("種別", options=utils.REQUEST_KINDS),
-        },
-        num_rows="dynamic",
-        width="stretch",
-        hide_index=True,
-        key="requests_editor",
-    )
-    req_edited = req_edited.dropna(subset=["name", "date", "kind"])
-    req_edited["staff_id"] = req_edited["name"].map(id_by_name)
-    req_edited["date"] = req_edited["date"].apply(lambda d: d if isinstance(d, dt.date) else pd.to_datetime(d).date())
-    st.session_state.requests_df = req_edited[["staff_id", "name", "date", "kind"]].reset_index(drop=True)
-    # 手入力・編集(および直前のCSVインポート)の内容を、この月度専用のファイルへ
-    # 即時にローカル自動保存する(未来の月度の先行入力もそのまま保存される)。
-    utils.save_requests_to_disk(st.session_state.requests_df, path=utils.saved_kyuka_path_for(year, month))
+            st.markdown("---")
+            if st.button("🗑️ 休暇データをリセット（この月度のみ・管理者操作）", key="reset_requests_button"):
+                utils.clear_kyuka_log(kyuka_log_path)
+                st.success(f"{period_label}の希望休・有休データをリセットしました。")
+                st.rerun()
 
 
 # --- Tab3: シフト結果・警告 ---------------------------------------------------

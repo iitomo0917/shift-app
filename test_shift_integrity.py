@@ -445,12 +445,16 @@ def check_month_switch_no_crash_and_kyuka_isolation() -> list[str]:
     """実際のStreamlitアプリ(app.py)上で、(1)最適化済みの月度から未計算の別月度へ
     切り替えてもクラッシュせず結果がリセットされること、(2)月度ごとの希望休データが
     互いに独立して保存・復元されることを、AppTestで実機に近い形で確認する。
+
+    希望休データは新方式(追記型ログ)で管理されるため、「セッションの外側
+    (=他ブラウザ・他端末を模した直接のログ追記)から届いた申請が、次の画面
+    再描画で確実に反映される」ことも合わせて検証する。
     """
     issues = []
     # このチェックは実際の app.py (本番の data/ ディレクトリを参照) を通すため、
     # 既存の実運用データを壊さないよう、対象月度の保存ファイルを一時退避し、
     # 終了後に必ず元の内容へ復元する。
-    target_paths = [utils.saved_kyuka_path_for(y, m) for y, m in [(2026, 9), (2026, 11)]] + [
+    target_paths = [utils.kyuka_log_path_for(y, m) for y, m in [(2026, 9), (2026, 11)]] + [
         utils.LATEST_SHIFT_PATH,
         utils.LATEST_SHIFT_META_PATH,
     ]
@@ -470,16 +474,13 @@ def check_month_switch_no_crash_and_kyuka_isolation() -> list[str]:
         if list(at.exception):
             issues.append(f"初回最適化で例外: {at.exception}")
 
-        sid = at.session_state["staff_df"].loc[at.session_state["staff_df"]["name"] == "生駒", "staff_id"].iloc[0]
-        sept_df = pd.concat(
-            [
-                at.session_state["requests_df"],
-                pd.DataFrame([{"staff_id": sid, "name": "生駒", "date": dt.date(2026, 9, 20), "kind": "希望休"}]),
-            ],
-            ignore_index=True,
-        )
-        at.session_state["requests_df"] = sept_df
+        # 「別ブラウザ/別端末から9月度の希望休が1件届いた」ことを、セッションの
+        # session_state を直接いじらずログへの追記のみで再現する(=個別申請フォーム
+        # が append_kyuka_request を呼ぶのと同じ経路)。
+        utils.append_kyuka_request("生駒", dt.date(2026, 9, 20), "希望休", utils.kyuka_log_path_for(2026, 9))
         at.run()
+        if len(at.session_state["requests_df"]) != 1 or at.session_state["requests_df"].iloc[0]["name"] != "生駒":
+            issues.append("ログへの直接追記が次の画面再描画で反映されない")
 
         month_selectbox = at.sidebar.selectbox[0]
         month_selectbox.select(11).run()
@@ -502,8 +503,8 @@ def check_month_switch_no_crash_and_kyuka_isolation() -> list[str]:
         if len(restored) != 1 or restored.iloc[0]["name"] != "生駒":
             issues.append(f"9月度に戻した際の希望休データが正しく復元されない(件数={len(restored)})")
     finally:
-        # 一時退避したファイルを元に戻す。テストが新規作成したファイルのうち
-        # 元々存在しなかったものは削除する。
+        # 一時退避したファイルを元に戻す。テストが新規作成したファイル(ログ本体・
+        # ロックファイル)のうち元々存在しなかったものは削除する。
         for p in target_paths:
             if p in backups:
                 os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -511,7 +512,77 @@ def check_month_switch_no_crash_and_kyuka_isolation() -> list[str]:
                     f.write(backups[p])
             elif os.path.exists(p):
                 os.remove(p)
+            lock_p = p + ".lock"
+            if os.path.exists(lock_p):
+                os.remove(lock_p)
 
+    return issues
+
+
+def check_kyuka_concurrent_requests_no_data_loss() -> list[str]:
+    """複数ブラウザ/端末からの同時申請で、互いのデータが消えないことを検証する。
+
+    旧方式(全体テーブルの上書き保存)では、Aさんの端末が保持する古いスナップ
+    ショットが、Bさんの申請保存後に再保存されるとBさんの分を消してしまう
+    競合が起こり得た。新方式(行単位追記ログ)ではこれが原理的に起こらない
+    ことを、直接ログを操作して確認する。
+    """
+    issues = []
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        log_path = os.path.join(tmp_dir, "kyuka_requests_2026_09.csv")
+        staff_df = utils.default_staff_df()
+
+        def current():
+            return utils.compute_current_requests_from_log(utils.load_kyuka_log(log_path), staff_df)
+
+        if not current().empty:
+            issues.append("初期状態が空になっていない")
+
+        # セッションA・Bがそれぞれ別の申請を(旧方式なら競合するタイミングで)送信する。
+        utils.append_kyuka_request("生駒", dt.date(2026, 9, 18), "希望休", log_path)
+        utils.append_kyuka_request("辻本", dt.date(2026, 9, 19), "有休申請", log_path)
+
+        pairs = set(zip(current()["name"], current()["date"]))
+        if ("生駒", dt.date(2026, 9, 18)) not in pairs:
+            issues.append("先に保存された申請(生駒)が後続の申請によって消えている")
+        if ("辻本", dt.date(2026, 9, 19)) not in pairs:
+            issues.append("後から保存された申請(辻本)が反映されていない")
+        if len(current()) != 2:
+            issues.append(f"申請件数が想定と異なる(期待2件、実際{len(current())}件)")
+
+        # 取消(論理削除)が正しく反映されることも確認する。
+        utils.append_kyuka_request("生駒", dt.date(2026, 9, 18), utils.CANCELLED_REQUEST_TYPE, log_path)
+        pairs2 = set(zip(current()["name"], current()["date"]))
+        if ("生駒", dt.date(2026, 9, 18)) in pairs2:
+            issues.append("取消申請後も生駒の希望休が残っている")
+        if len(current()) != 1:
+            issues.append(f"取消後の件数が想定と異なる(期待1件、実際{len(current())}件)")
+
+        # 管理者マトリクス編集の差分保存が、編集中に届いた無関係な新規申請を
+        # 巻き込んで消してしまわないことも確認する。
+        dates_df = utils.classify_days(utils.get_period_dates(2026, 9))
+        labels = utils.kyuka_matrix_date_labels(dates_df)
+        target_label, target_date = labels[5], list(dates_df["date"])[5]
+
+        admin_snapshot = current()  # 管理者がマトリクス表を開いた時点の状態
+        wide = utils.build_kyuka_requests_wide(admin_snapshot, staff_df, dates_df)
+        wide.loc[wide["スタッフ名"] == "尾澤", target_label] = "希望休"
+        edited_long = utils.kyuka_requests_wide_to_long(wide, staff_df, dates_df)
+
+        # 管理者が編集している間に、別のスタッフ(山岡)から新規申請が届いたとする。
+        utils.append_kyuka_request("山岡", dt.date(2026, 9, 20), "有休確定", log_path)
+        # 差分の基準は「管理者が編集を始めた時点のスナップショット」であるべきで、
+        # ここで最新状態を読み直してはいけない(読み直すと山岡の新規申請が
+        # 誤って取消として上書きされてしまう=まさにこのテストで検出したい不具合)。
+        utils.sync_admin_requests_edit(admin_snapshot, edited_long, log_path)
+
+        final_pairs = set(zip(current()["name"], current()["date"]))
+        if ("山岡", dt.date(2026, 9, 20)) not in final_pairs:
+            issues.append("管理者編集の保存で、編集中に届いた他スタッフの新規申請が消えている")
+        if ("辻本", dt.date(2026, 9, 19)) not in final_pairs:
+            issues.append("管理者編集の保存で、無関係な既存申請(辻本)が消えている")
+        if ("尾澤", target_date) not in final_pairs:
+            issues.append("管理者マトリクス編集によるセル変更(尾澤)が保存されていない")
     return issues
 
 
@@ -553,9 +624,10 @@ def main():
     )
     record("4b. 既に休みのスタッフが候補に出現しないか", check_leave_candidate_excludes_already_off(staff_df, dates_df))
 
-    record("5a. 希望休・有休データのローカル永続化", check_requests_persistence())
+    record("5a. 希望休・有休データのローカル永続化(旧方式・後方互換)", check_requests_persistence())
     record("5b. 最適化結果のローカル永続化", check_shift_result_persistence())
     record("5c. 手動編集後のアラート連動", check_manual_edit_alert_sync(result, staff_df, dates_df))
+    record("5d. 希望休・有休の同時申請でデータが消えないこと(追記型ログ)", check_kyuka_concurrent_requests_no_data_loss())
 
     record("6a. 別期間(10/10を含まない月)でのクラッシュ非発生と基本要件", check_different_period_no_crash())
     record("6b. 特別休業日を含む期間の整合性", check_special_closure_days_integration())

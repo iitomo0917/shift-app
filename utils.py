@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import calendar
 import colorsys
+import csv
 import datetime as dt
 import io
 import json
 import os
 import re
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Optional
@@ -450,6 +452,243 @@ def clear_saved_requests(path: str = SAVED_KYUKA_PATH) -> None:
     """ローカル保存済みの希望休・有休データを削除する(リセット機能用)。"""
     if os.path.exists(path):
         os.remove(path)
+
+
+# ---------------------------------------------------------------------------
+# 希望休・有休の「個別申請・追記型ログ」管理
+#
+# 旧方式(save_requests_to_disk)は、画面上の全スタッフ分の入力テーブルを毎回
+# まるごと1つのCSVへ上書き保存していた。このため、Aさんの端末が古いスナップ
+# ショットを保持したまま(=Bさんが追加した申請をまだ知らない状態のまま)何らか
+# の理由で再保存されると、Bさんの申請ごと消えてしまう競合が起こり得た。
+#
+# 新方式では、申請1件ごとに「誰が・いつ・何を申請したか」を1行としてログCSV
+# (data/kyuka_requests_{year}_{month:02d}.csv)へ追記するのみとし、既存行の
+# 読み込み→書き換え→全体保存は一切行わない。これにより、複数ブラウザ/端末から
+# 同時に送信されても互いの行を上書き・消去することがなくなる(=追記は原理的に
+# 衝突しない)。取消も「取消」種別の行を追記する論理削除として扱う。
+# 現在の有効な申請一覧は、(スタッフ名, 日付)ごとにログの最新行を採用すること
+# で都度再構築する(=イベントソーシング/追記ログの考え方)。
+# ---------------------------------------------------------------------------
+
+KYUKA_LOG_COLUMNS = ["staff_name", "date", "request_type", "updated_at"]
+CANCELLED_REQUEST_TYPE = "取消"  # ログ上の取消(論理削除)マーカー
+
+
+def kyuka_log_path_for(year: int, month: int) -> str:
+    """月度別の希望休・有休「追記型ログ」の保存パスを返す。"""
+    return os.path.join(DATA_DIR, f"kyuka_requests_{int(year)}_{int(month):02d}.csv")
+
+
+def _kyuka_lock_path(path: str) -> str:
+    return path + ".lock"
+
+
+def _acquire_kyuka_lock(path: str, timeout_sec: float = 5.0, poll_interval: float = 0.02) -> None:
+    """簡易な排他ロック(ロックファイル方式)を取得する。
+
+    追記自体はOS上ほぼアトミックだが、ヘッダー行の初回書き込みと本体行の
+    追記を1つの操作として直列化するため、念のためロックで保護する。
+    タイムアウトした場合は、異常終了で残った古いロックとみなして強制解放し、
+    保存処理自体が止まってしまわないようにする(可用性を優先)。
+    """
+    lock_path = _kyuka_lock_path(path)
+    deadline = time.time() + timeout_sec
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            return
+        except FileExistsError:
+            if time.time() > deadline:
+                try:
+                    os.remove(lock_path)
+                except OSError:
+                    pass
+                continue
+            time.sleep(poll_interval)
+
+
+def _release_kyuka_lock(path: str) -> None:
+    try:
+        os.remove(_kyuka_lock_path(path))
+    except OSError:
+        pass
+
+
+def append_kyuka_request(staff_name: str, date: dt.date, request_type: str, path: str) -> None:
+    """個別の希望休・有休申請(または取消)を1件、ログCSVへ追記する。
+
+    既存行の読み込み・書き換えを一切行わないため、他のスタッフが同時に別の
+    申請を送信していても、互いのデータを消去することがない。
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _acquire_kyuka_lock(path)
+    try:
+        file_is_new = not os.path.exists(path) or os.path.getsize(path) == 0
+        with open(path, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            if file_is_new:
+                writer.writerow(KYUKA_LOG_COLUMNS)
+            writer.writerow(
+                [
+                    staff_name,
+                    date.isoformat() if isinstance(date, dt.date) else str(date),
+                    request_type,
+                    dt.datetime.now().isoformat(timespec="seconds"),
+                ]
+            )
+    finally:
+        _release_kyuka_lock(path)
+
+
+def load_kyuka_log(path: str) -> pd.DataFrame:
+    """ログCSVの全行(履歴・取消行を含む)をそのまま読み込む。"""
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=KYUKA_LOG_COLUMNS)
+    try:
+        df = pd.read_csv(path, dtype=str, encoding="utf-8-sig")
+    except Exception:
+        return pd.DataFrame(columns=KYUKA_LOG_COLUMNS)
+    if df.empty:
+        return pd.DataFrame(columns=KYUKA_LOG_COLUMNS)
+    return df.reindex(columns=KYUKA_LOG_COLUMNS)
+
+
+def compute_current_requests_from_log(log_df: pd.DataFrame, staff_df: pd.DataFrame) -> pd.DataFrame:
+    """追記型ログから、現在有効な希望休・有休の一覧(requests_df形式)を再構築する。
+
+    同一の(スタッフ名, 日付)にログ行が複数ある場合は、ログの追記順で最後の行
+    (=最新の申請内容)のみを採用する。最新行が「取消」だった場合は、その
+    組み合わせを結果から除外する(論理削除)。
+    """
+    if log_df.empty:
+        return default_requests_df()
+
+    df = log_df.dropna(subset=["staff_name", "date"]).copy()
+    if df.empty:
+        return default_requests_df()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return default_requests_df()
+
+    # groupby(...).last() はグループ内の最終出現行(=ログ上で最も新しい申請)を採用する。
+    latest = df.groupby(["staff_name", "date"], as_index=False, sort=False).last()
+    latest = latest[latest["request_type"] != CANCELLED_REQUEST_TYPE]
+    if latest.empty:
+        return default_requests_df()
+
+    name_to_id = dict(zip(staff_df["name"], staff_df["staff_id"]))
+    latest = latest.copy()
+    latest["staff_id"] = latest["staff_name"].map(name_to_id)
+    latest = latest.dropna(subset=["staff_id"])
+    latest = latest.rename(columns={"staff_name": "name", "request_type": "kind"})
+    return latest.reindex(columns=["staff_id", "name", "date", "kind"]).reset_index(drop=True)
+
+
+def load_current_requests(year: int, month: int, staff_df: pd.DataFrame) -> pd.DataFrame:
+    """指定月度の「現在有効な」希望休・有休一覧を、追記型ログから再構築して返す。
+
+    新方式のログファイルがまだ存在しない場合は、旧方式(全体上書き保存)の
+    保存済みファイルが残っていればログへ1回だけ移行し(データを失わないため)、
+    以降はログを正としてこの関数から状態を再構築する。
+    """
+    log_path = kyuka_log_path_for(year, month)
+    if not os.path.exists(log_path):
+        legacy_path = saved_kyuka_path_for(year, month)
+        if os.path.exists(legacy_path):
+            legacy_df = load_requests_from_disk(path=legacy_path)
+            for _, r in legacy_df.iterrows():
+                append_kyuka_request(r["name"], r["date"], r["kind"], log_path)
+
+    log_df = load_kyuka_log(log_path)
+    return compute_current_requests_from_log(log_df, staff_df)
+
+
+def sync_admin_requests_edit(current_df: pd.DataFrame, edited_df: pd.DataFrame, path: str) -> None:
+    """管理者によるマトリクス表の一括編集を、追記型ログへの差分追記に変換して保存する。
+
+    `current_df`(編集前の集計状態)と`edited_df`(編集後の状態)を比較し、
+    実際に値が変化した(スタッフ名, 日付)の組み合わせについてのみ新しいログ行
+    (追加/変更は新種別、削除は「取消」)を追記する。変化のない申請には一切
+    触れないため、この編集と同時に他のスタッフが送信した個別申請を巻き込んで
+    消してしまうことがない。
+
+    重要: `current_df` には、管理者が実際に編集を始めた時点のスナップショット
+    (=マトリクス表を描画した際に使った状態)を渡すこと。この関数を呼ぶ直前に
+    改めてディスクから最新状態を読み直して渡してはならない。読み直してしまうと、
+    管理者が編集している間に他のスタッフが送信した新規申請が「編集前後で消えた
+    差分」と誤認識され、取消として上書きされてしまう。
+    """
+    cur_map = {(r["name"], r["date"]): r["kind"] for _, r in current_df.iterrows()} if not current_df.empty else {}
+    new_map = {(r["name"], r["date"]): r["kind"] for _, r in edited_df.iterrows()} if not edited_df.empty else {}
+
+    for key in set(cur_map) | set(new_map):
+        old_kind = cur_map.get(key)
+        new_kind = new_map.get(key)
+        if old_kind == new_kind:
+            continue
+        name, date = key
+        append_kyuka_request(name, date, new_kind if new_kind is not None else CANCELLED_REQUEST_TYPE, path)
+
+
+def clear_kyuka_log(path: str) -> None:
+    """指定月度の希望休・有休ログを削除する(リセット機能用)。"""
+    if os.path.exists(path):
+        os.remove(path)
+    lock_path = _kyuka_lock_path(path)
+    if os.path.exists(lock_path):
+        os.remove(lock_path)
+
+
+def kyuka_matrix_date_labels(dates_df: pd.DataFrame) -> list[str]:
+    """希望休マトリクス表の列見出し(対象期間の全日付)を返す。"""
+    return [f"{d.month}/{d.day}({wd})" for d, wd in zip(dates_df["date"], dates_df["weekday_jp"])]
+
+
+def build_kyuka_requests_wide(
+    requests_df: pd.DataFrame,
+    staff_df: pd.DataFrame,
+    dates_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """現在の申請一覧(長形式)を、管理者用マトリクス表(スタッフ×日付)に変換する。"""
+    date_labels = kyuka_matrix_date_labels(dates_df)
+    lookup: dict[tuple[str, dt.date], str] = {}
+    if not requests_df.empty:
+        for _, r in requests_df.iterrows():
+            lookup[(r["name"], r["date"])] = r["kind"]
+
+    wide = pd.DataFrame({"スタッフ名": staff_df["name"].tolist()})
+    for label, d in zip(date_labels, dates_df["date"]):
+        wide[label] = [lookup.get((nm, d), "") for nm in staff_df["name"]]
+    return wide
+
+
+def kyuka_requests_wide_to_long(
+    wide_df: pd.DataFrame,
+    staff_df: pd.DataFrame,
+    dates_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """管理者用マトリクス表(編集後)を、申請一覧(長形式)へ変換する。
+
+    空欄・未知の種別値は無視する(クラッシュしない)。
+    """
+    date_labels = kyuka_matrix_date_labels(dates_df)
+    label_to_date = dict(zip(date_labels, dates_df["date"]))
+    name_to_id = dict(zip(staff_df["name"], staff_df["staff_id"]))
+
+    rows = []
+    for _, r in wide_df.iterrows():
+        name = r.get("スタッフ名")
+        if name not in name_to_id:
+            continue
+        for label in date_labels:
+            val = str(r.get(label, "")).strip()
+            if val not in REQUEST_KINDS:
+                continue
+            rows.append({"staff_id": name_to_id[name], "name": name, "date": label_to_date[label], "kind": val})
+    return pd.DataFrame(rows, columns=["staff_id", "name", "date", "kind"])
 
 
 # ---------------------------------------------------------------------------
