@@ -264,8 +264,8 @@ def check_excel_export_styles(
                 issues.append(f"{sheet_name}: 1行目の行高が39pt(52px相当)でない(実際{h1})")
             for r in range(2, header_and_store_rows_end + 1):
                 h = ws.row_dimensions[r].height
-                if h != 26.25:
-                    issues.append(f"{sheet_name}: {r}行目の行高が26.25pt(35px相当)でない(実際{h})")
+                if h != 21.75:
+                    issues.append(f"{sheet_name}: {r}行目の行高が21.75pt(29px相当)でない(実際{h})")
         else:
             for r in range(1, 19):
                 h = ws.row_dimensions[r].height
