@@ -347,9 +347,17 @@ with tab1:
 
 
 # --- Tab2: スタッフ・希望休設定 ---------------------------------------------
+# 業務フロー順(1.個別申請 → 2.管理者マトリクス確認 → 3.CSV一括入出力 →
+# 4.スタッフマスター)に上から並べる。各セクションは st.session_state / 画面
+# 冒頭で確定済みの dates_df・year・month・period_dates・period_label・
+# kyuka_log_path のみを参照する自己完結構成のため、順序を入れ替えても
+# 未定義変数の参照(NameError等)は発生しない。
 with tab2:
     kyuka_log_path = utils.kyuka_log_path_for(year, month)
 
+    # =========================================================================
+    # 1. 希望休・有休 個別申請フォーム(最上部)
+    # =========================================================================
     st.subheader("📝 希望休・有休 個別申請フォーム")
     st.caption(
         "スタッフご本人がスマホ・店舗PCから入力してください。1件ごとに即時追記保存されるため、"
@@ -396,8 +404,78 @@ with tab2:
                 utils.append_kyuka_request(r["name"], r["date"], utils.CANCELLED_REQUEST_TYPE, kyuka_log_path)
                 st.rerun()
 
-    st.markdown("---")
-    st.subheader("希望休・有休 CSV一括インポート")
+    st.divider()
+
+    # =========================================================================
+    # 2. 管理者用 全体休暇マトリックス表(日別×スタッフ別)
+    # =========================================================================
+    st.subheader("📋 管理者用 全体休暇マトリックス表（日別×スタッフ別）")
+    st.caption(
+        "種別: 希望休(ソフト) / 絶対休(ハード=100%遵守) / 有休申請(ソフト・有休可能日で優先) / 有休確定(ハード)"
+        f"　※ 個別申請フォーム・CSV取込の内容は、月度ごとに独立した追記型ログ"
+        f"(data/kyuka_requests_{year}_{month:02d}.csv)へ即時保存され、再起動や別ブラウザ"
+        "でのアクセス時にも復元されます。2〜3ヶ月先の月度に切り替えて先行入力しても、"
+        "他の月度のデータとは混ざりません。"
+    )
+    st.caption(
+        "この表は個別申請フォームからの入力を自動集計したものです。閲覧は誰でも可能ですが、"
+        "セルを直接書き換えられるのは管理者パスコードを入力した場合のみです。"
+        "(パスコードは .streamlit/secrets.toml の admin_passcode で設定してください)"
+    )
+
+    current_requests_df = st.session_state.requests_df
+    wide_matrix = utils.build_kyuka_requests_wide(current_requests_df, st.session_state.staff_df, dates_df)
+    date_cols = [c for c in wide_matrix.columns if c != "スタッフ名"]
+
+    admin_mode = st.checkbox("管理者モードで編集する", key="kyuka_admin_mode")
+    if not admin_mode:
+        st.dataframe(wide_matrix, width="stretch", height=400, hide_index=True)
+    else:
+        admin_passcode_input = st.text_input("管理者パスコード", type="password", key="kyuka_admin_passcode")
+        if admin_passcode_input != _admin_passcode():
+            if admin_passcode_input:
+                st.error("パスコードが違います。")
+            st.dataframe(wide_matrix, width="stretch", height=400, hide_index=True)
+        else:
+            st.success("管理者モードが有効です。セルを直接編集して保存できます。")
+            edited_matrix = st.data_editor(
+                wide_matrix,
+                column_config={
+                    "スタッフ名": st.column_config.TextColumn("スタッフ名", disabled=True),
+                    **{
+                        col: st.column_config.SelectboxColumn(col, options=[""] + utils.REQUEST_KINDS)
+                        for col in date_cols
+                    },
+                },
+                hide_index=True,
+                width="stretch",
+                height=400,
+                key="kyuka_admin_matrix_editor",
+            )
+            if st.button("💾 管理者による変更を保存", key="kyuka_admin_matrix_save"):
+                edited_long = utils.kyuka_requests_wide_to_long(edited_matrix, st.session_state.staff_df, dates_df)
+                # 差分の基準は、このマトリクス表を描画した時点のスナップショット
+                # (wide_matrixの元になったcurrent_requests_df)にする。ここで改めて
+                # ディスクを読み直すと、管理者が編集していた間に他のスタッフが送信
+                # した個別申請が「管理者が消した差分」と誤認識され、巻き込んで
+                # 消えてしまうため、あえて読み直さない。実際に値が変化したセルの
+                # 分だけが差分追記される。
+                utils.sync_admin_requests_edit(current_requests_df, edited_long, kyuka_log_path)
+                st.success("マトリクス表の変更を保存しました。")
+                st.rerun()
+
+            st.markdown("---")
+            if st.button("🗑️ 休暇データをリセット（この月度のみ・管理者操作）", key="reset_requests_button"):
+                utils.clear_kyuka_log(kyuka_log_path)
+                st.success(f"{period_label}の希望休・有休データをリセットしました。")
+                st.rerun()
+
+    st.divider()
+
+    # =========================================================================
+    # 3. 希望休・有休 CSV一括インポート / エクスポート
+    # =========================================================================
+    st.subheader("📁 希望休・有休 CSV一括インポート / エクスポート")
     st.caption(
         "「スタッフ名, 日付, 種別」の縦持ち3列形式、または「スタッフ名×日付」の"
         "マトリクス形式のいずれのCSVも読み込めます。値は 希望休(または休)/有休/絶対休 "
@@ -457,8 +535,12 @@ with tab2:
                 st.success(f"{len(new_rows_df)} 件の希望休・有休データを取り込みました。")
                 st.rerun()
 
-    st.markdown("---")
-    st.subheader("スタッフマスタ")
+    st.divider()
+
+    # =========================================================================
+    # 4. スタッフマスター設定(属性・勤務日数レンジ)
+    # =========================================================================
+    st.subheader("👥 スタッフマスター設定（属性・勤務日数レンジ）")
     st.caption(
         "社員区分・主所属店舗・測定/加工スキル保有・嘱託の最低勤務日数を編集できます。"
         "勤務可能店舗はパートの役割(A〜E)に応じて自動制限されます。"
@@ -558,68 +640,7 @@ with tab2:
         merged[col] = edited[col].values
     merged["preferred_off_date"] = edited["個別公休希望日"].map(lambda lbl: label_to_date.get(lbl))
     st.session_state.staff_df = recompute_allowed_stores(merged)
-
-    st.markdown("---")
-    st.subheader("🔒 管理者用：全体マトリクス表（日別×スタッフ別）")
-    st.caption(
-        "種別: 希望休(ソフト) / 絶対休(ハード=100%遵守) / 有休申請(ソフト・有休可能日で優先) / 有休確定(ハード)"
-        f"　※ 個別申請フォーム・CSV取込の内容は、月度ごとに独立した追記型ログ"
-        f"(data/kyuka_requests_{year}_{month:02d}.csv)へ即時保存され、再起動や別ブラウザ"
-        "でのアクセス時にも復元されます。2〜3ヶ月先の月度に切り替えて先行入力しても、"
-        "他の月度のデータとは混ざりません。"
-    )
-    st.caption(
-        "この表は個別申請フォームからの入力を自動集計したものです。閲覧は誰でも可能ですが、"
-        "セルを直接書き換えられるのは管理者パスコードを入力した場合のみです。"
-        "(パスコードは .streamlit/secrets.toml の admin_passcode で設定してください)"
-    )
-
-    current_requests_df = st.session_state.requests_df
-    wide_matrix = utils.build_kyuka_requests_wide(current_requests_df, st.session_state.staff_df, dates_df)
-    date_cols = [c for c in wide_matrix.columns if c != "スタッフ名"]
-
-    admin_mode = st.checkbox("管理者モードで編集する", key="kyuka_admin_mode")
-    if not admin_mode:
-        st.dataframe(wide_matrix, width="stretch", height=400, hide_index=True)
-    else:
-        admin_passcode_input = st.text_input("管理者パスコード", type="password", key="kyuka_admin_passcode")
-        if admin_passcode_input != _admin_passcode():
-            if admin_passcode_input:
-                st.error("パスコードが違います。")
-            st.dataframe(wide_matrix, width="stretch", height=400, hide_index=True)
-        else:
-            st.success("管理者モードが有効です。セルを直接編集して保存できます。")
-            edited_matrix = st.data_editor(
-                wide_matrix,
-                column_config={
-                    "スタッフ名": st.column_config.TextColumn("スタッフ名", disabled=True),
-                    **{
-                        col: st.column_config.SelectboxColumn(col, options=[""] + utils.REQUEST_KINDS)
-                        for col in date_cols
-                    },
-                },
-                hide_index=True,
-                width="stretch",
-                height=400,
-                key="kyuka_admin_matrix_editor",
-            )
-            if st.button("💾 管理者による変更を保存", key="kyuka_admin_matrix_save"):
-                edited_long = utils.kyuka_requests_wide_to_long(edited_matrix, st.session_state.staff_df, dates_df)
-                # 差分の基準は、このマトリクス表を描画した時点のスナップショット
-                # (wide_matrixの元になったcurrent_requests_df)にする。ここで改めて
-                # ディスクを読み直すと、管理者が編集していた間に他のスタッフが送信
-                # した個別申請が「管理者が消した差分」と誤認識され、巻き込んで
-                # 消えてしまうため、あえて読み直さない。実際に値が変化したセルの
-                # 分だけが差分追記される。
-                utils.sync_admin_requests_edit(current_requests_df, edited_long, kyuka_log_path)
-                st.success("マトリクス表の変更を保存しました。")
-                st.rerun()
-
-            st.markdown("---")
-            if st.button("🗑️ 休暇データをリセット（この月度のみ・管理者操作）", key="reset_requests_button"):
-                utils.clear_kyuka_log(kyuka_log_path)
-                st.success(f"{period_label}の希望休・有休データをリセットしました。")
-                st.rerun()
+    st.caption("↑ このテーブルの編集内容は選択のたびに自動反映されます（別途保存ボタンは不要です）。")
 
 
 # --- Tab3: シフト結果・警告 ---------------------------------------------------
