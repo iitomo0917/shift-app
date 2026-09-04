@@ -4,14 +4,14 @@
 
 test_shift_integrity.py が「デフォルトシナリオ1本」を対象にした基本検証で
 あるのに対し、本スクリプトは以下4つの異なるシナリオそれぞれについて
-ソルバーを実行し、各シナリオごとに重点チェック項目(希望休・有給確定の
+ソルバーを実行し、各シナリオごとに重点チェック項目(希望休・有給申請の
 反映精度、自動生成シフトの整合性、テーブル構造・Excel出力・手動編集の
 堅牢性)を検証する。重複ロジックは test_shift_integrity.py の既存チェック
 関数を単一の真実の情報源として再利用する。
 
 シナリオ:
   A. 通常月シナリオ          - 標準的な希望休・有休データでの基本検証
-  B. 希望休・有休集中シナリオ - 特定週末・特定店舗への希望休/有給確定の集中
+  B. 希望休・有休集中シナリオ - 特定週末・特定店舗への希望休/有給申請の集中
   C. 特別休業日3日設定シナリオ - 盆・年末年始+3日相当の臨時休業を追加
   D. 未来月先行入力・月度切り替えシナリオ - 9→10→11→9→10月度を往復
 
@@ -50,19 +50,19 @@ def _req(name_to_id: dict, name: str, date: dt.date, kind: str) -> dict:
 
 # ---------------------------------------------------------------------------
 # 共通チェック(4シナリオ共通で使い回す)。
-# 【重点チェック項目1】希望休・有給確定の反映精度
+# 【重点チェック項目1】希望休・有給申請の反映精度
 # ---------------------------------------------------------------------------
 
 def check_confirmed_leave_zero_attendance(shift_df: pd.DataFrame, requests_df: pd.DataFrame) -> list[str]:
-    """「有給確定」が設定された日は、例外なく全スタッフが店舗出勤ゼロになっているか。"""
+    """「有給申請」が設定された日は、例外なく全スタッフが店舗出勤ゼロになっているか。"""
     issues = []
     if requests_df.empty:
         return issues
-    confirmed = requests_df[requests_df["kind"] == "有給確定"]
+    confirmed = requests_df[requests_df["kind"] == "有給申請"]
     working_pairs = set(zip(shift_df["staff_id"], shift_df["date"])) if not shift_df.empty else set()
     for _, r in confirmed.iterrows():
         if (r["staff_id"], r["date"]) in working_pairs:
-            issues.append(f"{r['name']} {r['date']}: 有給確定日にもかかわらず出勤している")
+            issues.append(f"{r['name']} {r['date']}: 有給申請日にもかかわらず出勤している")
     return issues
 
 
@@ -73,11 +73,11 @@ def check_salaried_workdays_exact(
     requests_df: pd.DataFrame,
     base_holiday_quota: int,
 ) -> list[str]:
-    """店長・正社員の出勤日数が「基準出勤日数 − 期間内の有給確定日数」に厳格一致しているか。
+    """店長・正社員の出勤日数が「基準出勤日数 − 期間内の有給申請日数」に厳格一致しているか。
 
     基準出勤日数そのものは対象期間のカレンダーから動的に導出する(固定値を
-    ハードコードしない)。有給確定を1件も持たないスタッフは「基準出勤日数と
-    厳格一致」、有給確定をn件持つスタッフは「基準出勤日数-n日」を期待値とする。
+    ハードコードしない)。有給申請を1件も持たないスタッフは「基準出勤日数と
+    厳格一致」、有給申請をn件持つスタッフは「基準出勤日数-n日」を期待値とする。
     """
     issues = []
     expected_workdays = len(dates_df) - base_holiday_quota
@@ -91,7 +91,7 @@ def check_salaried_workdays_exact(
             confirmed_cnt = int(
                 (
                     (requests_df["staff_id"] == sid)
-                    & (requests_df["kind"] == "有給確定")
+                    & (requests_df["kind"] == "有給申請")
                     & (requests_df["date"].isin(business_days))
                 ).sum()
             )
@@ -99,7 +99,7 @@ def check_salaried_workdays_exact(
         if cnt != expected:
             issues.append(
                 f"{row['name']}: 出勤{cnt}日"
-                f"(期待値{expected}日 = 基準{expected_workdays}日-有給確定{confirmed_cnt}日)"
+                f"(期待値{expected}日 = 基準{expected_workdays}日-有給申請{confirmed_cnt}日)"
             )
     return issues
 
@@ -305,7 +305,7 @@ def check_excel_export_styles(
 
 
 def check_shortage_attribution_accuracy(shortages: list[dict]) -> list[str]:
-    """負荷・エッジケースシナリオ(希望休・有給確定の意図的な集中)では、店舗の
+    """負荷・エッジケースシナリオ(希望休・有給申請の意図的な集中)では、店舗の
     必要人員に対する不足が現実的に発生し得る(optimizer.py が「不足/超過スラック
     変数＋重いペナルティ」で意図的にソフト化している領域であり、7店舗×2名の
     週末必要人員=14枠に対し社員・嘱託の総数もちょうど14名という無遊び構成の
@@ -374,10 +374,10 @@ def run_common_post_solve_checks(
     strict_day_ranges: bool = True,
     strict_store_headcount: bool = True,
 ) -> None:
-    record(scenario, "有給確定日の出勤ゼロ", check_confirmed_leave_zero_attendance(result.shift_df, requests_df))
+    record(scenario, "有給申請日の出勤ゼロ", check_confirmed_leave_zero_attendance(result.shift_df, requests_df))
     record(
         scenario,
-        "店長・正社員の出勤日数(基準日数-有給確定日数に厳格一致)",
+        "店長・正社員の出勤日数(基準日数-有給申請日数に厳格一致)",
         check_salaried_workdays_exact(result.shift_df, staff_df, dates_df, requests_df, base_holiday_quota),
     )
     record(scenario, "個別公休1日の確保", check_individual_off_day_preserved(result.shift_df, staff_df, dates_df))
@@ -389,7 +389,7 @@ def run_common_post_solve_checks(
         record(scenario, "店舗成立要件(不足許容日を除く)", real_shortages)
         record(scenario, "名古屋中川店 土日祝 社員2名以上", tsi.check_nakagawa_weekend(result, staff_df, dates_df))
     else:
-        # 希望休・有給確定を意図的に集中させた負荷シナリオでは、週末必要人員
+        # 希望休・有給申請を意図的に集中させた負荷シナリオでは、週末必要人員
         # (7店舗×2名=14枠)と社員・嘱託の総数(14名)がちょうど釣り合っている
         # ため、週末に1名でも休むとどこかで必ず不足が生じる(optimizer.pyが
         # 意図的にソフト制約として設計している領域)。不足の発生そのものは
@@ -436,15 +436,15 @@ def scenario_a_normal_month() -> None:
     staff_df = utils.default_staff_df()
     business_days = list(dates_df.loc[dates_df["is_business_day"], "date"])
     # 「通常月」シナリオは典型的な希望休・有休の入り方を想定するため、店長・
-    # 正社員の有給確定は平日に限定する(土日祝は週末必要人員14枠(7店舗×2名)
+    # 正社員の有給申請は平日に限定する(土日祝は週末必要人員14枠(7店舗×2名)
     # に対し社員・嘱託の総数もちょうど14名という無遊び構成のため、土日祝の
-    # 有給確定はどのスタッフでも構造的に不足を生みやすい=シナリオBで別途
+    # 有給申請はどのスタッフでも構造的に不足を生みやすい=シナリオBで別途
     # 意図的に検証する負荷エッジケースであり、こちらでは対象外とする)。
     weekday_business_days = [d for d in business_days if d.weekday() not in (5, 6)]
     name_to_id = dict(zip(staff_df["name"], staff_df["staff_id"]))
 
     requests_rows = [
-        _req(name_to_id, "生駒", weekday_business_days[3], "有給確定"),
+        _req(name_to_id, "生駒", weekday_business_days[3], "有給申請"),
         _req(name_to_id, "加藤", weekday_business_days[10], "希望休"),
         _req(name_to_id, "尾澤", weekday_business_days[6], "絶対休"),
         _req(name_to_id, "柴田", weekday_business_days[12], "希望休"),
@@ -503,18 +503,18 @@ def scenario_b_concentrated_leave() -> None:
         return
     w1, w2 = weekend_days[0], weekend_days[1]
 
-    # 中川店・徳重店・稲沢店それぞれの主力スタッフの希望休・有給確定が
+    # 中川店・徳重店・稲沢店それぞれの主力スタッフの希望休・有給申請が
     # 同一週末に重複・集中するケース(=各店の主戦力が同時に抜ける負荷シナリオ)。
     requests_rows = [
-        _req(name_to_id, "内田", w1, "有給確定"),   # 名古屋中川店長
+        _req(name_to_id, "内田", w1, "有給申請"),   # 名古屋中川店長
         _req(name_to_id, "真田", w1, "希望休"),      # 正社員(全店ヘルプ可)
-        _req(name_to_id, "加藤", w1, "有給確定"),    # 徳重店長
-        _req(name_to_id, "生駒", w2, "有給確定"),    # 稲沢店長
+        _req(name_to_id, "加藤", w1, "有給申請"),    # 徳重店長
+        _req(name_to_id, "生駒", w2, "有給申請"),    # 稲沢店長
         _req(name_to_id, "山岡", w2, "希望休"),      # 嘱託(稲沢主所属)
     ]
     if holiday_only_days:
         h1 = holiday_only_days[0]
-        requests_rows.append(_req(name_to_id, "小林", h1, "有給確定"))  # 新蟹江店長
+        requests_rows.append(_req(name_to_id, "小林", h1, "有給申請"))  # 新蟹江店長
         requests_rows.append(_req(name_to_id, "竹内", h1, "有給申請"))  # 嘱託(全店ヘルプ可)
 
     requests_df = pd.DataFrame(requests_rows, columns=["staff_id", "name", "date", "kind"])
@@ -648,7 +648,7 @@ def scenario_d_future_month_switching() -> None:
         if at.session_state["solve_result"] is not None:
             issues.append("10月度切り替え後もsolve_resultが古い月度のまま残っている")
 
-        utils.append_kyuka_request("辻本", dt.date(2026, 10, 5), "有給確定", utils.kyuka_log_path_for(2026, 10))
+        utils.append_kyuka_request("辻本", dt.date(2026, 10, 5), "有給申請", utils.kyuka_log_path_for(2026, 10))
         at.run()
         if list(at.exception):
             issues.append(f"10月度再描画で例外: {at.exception}")

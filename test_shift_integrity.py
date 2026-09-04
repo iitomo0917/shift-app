@@ -267,10 +267,11 @@ def check_requests_persistence() -> list[str]:
     """本番の data/saved_kyuka.csv には一切触れず、一時ディレクトリ上で検証する
     (実運用データを誤って破壊しないため)。
 
-    「有休確定」は旧表記(区分名を「有給確定」に統一する前の表記)のまま
-    意図的に保存し、読み込み時に新表記「有給確定」へ正規化されることも
-    合わせて検証する(=表記変更だけで過去の確定休がハード制約から
-    外れてしまう事故が起きていないかの回帰チェック)。
+    「有休確定」(区分名を「有給」表記に統一する前の旧表記)と「有給確定」
+    (その後「有給申請」に統合・廃止された旧区分)の両方を意図的に保存し、
+    読み込み時にいずれも現行の「有給申請」へ正規化されることを検証する
+    (=表記変更・区分統合だけで過去の確定休がハード制約から外れてしまう
+    事故が起きていないかの回帰チェック)。
     """
     issues = []
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -279,20 +280,22 @@ def check_requests_persistence() -> list[str]:
             [
                 {"staff_id": "T01", "name": "生駒", "date": dt.date(2026, 9, 20), "kind": "希望休"},
                 {"staff_id": "P01", "name": "尾澤", "date": dt.date(2026, 10, 3), "kind": "有休確定"},
+                {"staff_id": "T02", "name": "辻本", "date": dt.date(2026, 10, 4), "kind": "有給確定"},
             ]
         )
         utils.save_requests_to_disk(df, path=tmp_path)
         loaded = utils.load_requests_from_disk(path=tmp_path)
-        if len(loaded) != 2:
-            issues.append(f"保存件数(2件)と復元件数({len(loaded)}件)が一致しない")
+        if len(loaded) != 3:
+            issues.append(f"保存件数(3件)と復元件数({len(loaded)}件)が一致しない")
         elif not all(isinstance(d, dt.date) for d in loaded["date"]):
             issues.append("復元後のdate列がdatetime.date型になっていない")
         else:
-            restored_kind = loaded.loc[loaded["name"] == "尾澤", "kind"].iloc[0]
-            if restored_kind != "有給確定":
-                issues.append(f"旧表記「有休確定」が新表記「有給確定」へ正規化されていない(実際: {restored_kind})")
-            if restored_kind not in utils.HARD_OFF_KINDS:
-                issues.append("正規化後の「有給確定」がHARD_OFF_KINDSに含まれていない")
+            for name, old_kind in (("尾澤", "有休確定"), ("辻本", "有給確定")):
+                restored_kind = loaded.loc[loaded["name"] == name, "kind"].iloc[0]
+                if restored_kind != "有給申請":
+                    issues.append(f"旧区分/旧表記「{old_kind}」が現行「有給申請」へ正規化されていない(実際: {restored_kind})")
+                if restored_kind not in utils.HARD_OFF_KINDS:
+                    issues.append(f"正規化後の「有給申請」({name})がHARD_OFF_KINDSに含まれていない")
         utils.clear_saved_requests(path=tmp_path)
         if len(utils.load_requests_from_disk(path=tmp_path)) != 0:
             issues.append("クリア後も希望休データが残っている")
@@ -587,7 +590,7 @@ def check_kyuka_concurrent_requests_no_data_loss() -> list[str]:
         edited_long = utils.kyuka_requests_wide_to_long(wide, staff_df, dates_df)
 
         # 管理者が編集している間に、別のスタッフ(山岡)から新規申請が届いたとする。
-        utils.append_kyuka_request("山岡", dt.date(2026, 9, 20), "有給確定", log_path)
+        utils.append_kyuka_request("山岡", dt.date(2026, 9, 20), "有給申請", log_path)
         # 差分の基準は「管理者が編集を始めた時点のスナップショット」であるべきで、
         # ここで最新状態を読み直してはいけない(読み直すと山岡の新規申請が
         # 誤って取消として上書きされてしまう=まさにこのテストで検出したい不具合)。

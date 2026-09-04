@@ -393,27 +393,31 @@ def default_requests_df() -> pd.DataFrame:
             "staff_id": pd.Series(dtype="str"),
             "name": pd.Series(dtype="str"),
             "date": pd.Series(dtype="object"),
-            "kind": pd.Series(dtype="str"),  # 希望休 / 絶対休 / 有給申請 / 有給確定
+            "kind": pd.Series(dtype="str"),  # 希望休 / 絶対休 / 有給申請
         }
     )
 
 
-REQUEST_KINDS = ["希望休", "絶対休", "有給申請", "有給確定"]
-HARD_OFF_KINDS = {"絶対休", "有給確定"}
-SOFT_OFF_KINDS = {"希望休", "有給申請"}
+REQUEST_KINDS = ["希望休", "絶対休", "有給申請"]
+HARD_OFF_KINDS = {"絶対休", "有給申請"}
+SOFT_OFF_KINDS = {"希望休"}
 
-# 旧表記(「有休」)からのデータ移行用エイリアス。過去に保存されたログ/CSVには
-# 旧表記の値がそのまま残っている可能性があるため、読み込み時に必ずこの表を
-# 通して新表記(「有給」)へ正規化する(=保存済みの絶対休/有給確定が、表記の
-# 変更だけでハード制約から外れてしまう事故を防ぐ)。
+# 旧表記からのデータ移行用エイリアス。過去に保存されたログ/CSVには、
+#   (1) 「有休」表記(現行の「有給」表記へ改称する前)
+#   (2) 「有給確定」区分(現行では廃止され「有給申請」に統合済み)
+# のいずれかがそのまま残っている可能性があるため、読み込み時に必ずこの表を
+# 通して現行の正規表記(「有給申請」)へ正規化する(=保存済みの絶対制約が、
+# 表記変更・区分統合だけでハード制約から外れてしまう事故を防ぐ)。
 _LEGACY_KIND_ALIASES = {
     "有休申請": "有給申請",
-    "有休確定": "有給確定",
+    "有休確定": "有給申請",  # 旧表記 かつ 廃止区分(二重の移行)
+    "有給確定": "有給申請",  # 区分統合(「有給確定」は廃止し「有給申請」に一本化)
 }
 
 
 def _normalize_kind_value(kind: str) -> str:
-    """kind文字列を、旧表記(有休)を含めて現行の正規表記(有給)へ正規化する。"""
+    """kind文字列を、旧表記(有休)・廃止区分(有給確定)を含めて現行の正規表記
+    (有給申請)へ正規化する。"""
     return _LEGACY_KIND_ALIASES.get(kind, kind)
 
 
@@ -825,12 +829,12 @@ _CSV_KIND_LOOKUP = {
     "希望休": "希望休",
     "休": "希望休",
     "公休": "希望休",
-    "有休": "有給確定",
-    "有給": "有給確定",
-    "有給確定": "有給確定",
-    "有休確定": "有給確定",  # 旧表記(後方互換)
+    "有休": "有給申請",
+    "有給": "有給申請",
     "有給申請": "有給申請",
     "有休申請": "有給申請",  # 旧表記(後方互換)
+    "有給確定": "有給申請",  # 廃止区分(後方互換、「有給申請」へ統合)
+    "有休確定": "有給申請",  # 旧表記・廃止区分(後方互換、「有給申請」へ統合)
     "絶対休": "絶対休",
 }
 
@@ -998,7 +1002,7 @@ def compute_paid_leave_availability(
     """営業日ごとに「有給取得可能人数枠（社員・嘱託向け）」を自動算出する。
 
     考え方:
-      その日の「社員(店長+正社員+嘱託)」の頭数のうち、既に絶対休/有給確定で
+      その日の「社員(店長+正社員+嘱託)」の頭数のうち、既に絶対休/有給申請で
       抜けている人数を除いた「稼働可能人数」から、全店運営に最低限必要な
       人数(min_required_employee_bodies_per_day)を差し引いた余力を、
       その日に新規で有休を割り当てられる人数枠とみなす。
@@ -1098,7 +1102,7 @@ def _min_required_employees_for_store(
 
 
 _LEAVE_REMOVABLE_TYPES = ("店長", "正社員")  # このロジックで「休みに回す」候補となる区分
-# 代替要員(ヘルプ投入)となりうる区分。店長・正社員は全員21日出勤(有給確定者は20日)で
+# 代替要員(ヘルプ投入)となりうる区分。店長・正社員は全員21日出勤(有給申請者は20日)で
 # 固定されており、代替に回すとその分だけ出勤日数が規定を超えてしまうため、
 # 代替候補には絶対に含めない(嘱託・パートのみが対象)。
 _LEAVE_SUBSTITUTE_TYPES = ("嘱託", "パート")
@@ -1118,7 +1122,7 @@ def compute_post_solve_leave_availability(
       ケース2(代替による創出): ちょうど最低人数で足りている場合でも、
         「実際にその日その店舗へ出勤しているスタッフ」の中から店長・正社員を
         1名「休み」に置き換えたと仮定し、その日どこにも出勤しておらず、かつ
-        希望休・絶対休・有給申請・有給確定のいずれも入っていない(=そもそも
+        希望休・絶対休・有給申請のいずれも入っていない(=そもそも
         休みたいわけではない)正社員/嘱託の中から
           - この店舗への勤務が許可されている(曜日限定の禁止ルールも含む)
           - 嘱託の場合は月間上限日数にまだ余裕がある
@@ -1158,7 +1162,7 @@ def compute_post_solve_leave_availability(
     staff_sat_sun_forbidden = dict(zip(staff_df["staff_id"], staff_df.get("saturday_sunday_forbidden_stores")))
     name_to_id = dict(zip(staff_df["name"], staff_df["staff_id"]))
 
-    # 希望休・絶対休・有給申請・有給確定のいずれかが入っている(staff_id, date)の集合。
+    # 希望休・絶対休・有給申請のいずれかが入っている(staff_id, date)の集合。
     # このいずれかに該当するスタッフは、そもそも休みたい/休みが確定しているため、
     # 代替要員として「呼び出す」候補には絶対にしない。
     requested_off_pairs: set[tuple[str, dt.date]] = set()
@@ -1297,7 +1301,7 @@ def compute_post_solve_leave_availability(
                     if not _is_idle(csid, d):
                         continue
                     if (csid, d) in requested_off_pairs:
-                        continue  # 希望休/絶対休/有給申請/有給確定が入っている人は呼び出さない
+                        continue  # 希望休/絶対休/有給申請が入っている人は呼び出さない
                     if not _has_day_capacity(csid):
                         continue
                     if has_skill and remaining_skilled == 0 and not bool(staff_has_skill.get(csid)):
@@ -1620,7 +1624,7 @@ def build_export_workbook(
 
     「店舗別日別シフト表」は現場配布・掲示にそのまま使えるよう、1セルに1名のみを
     配置する縦分割レイアウトとし、下段に休日スタッフ一覧(赤文字)を付す。
-    休日スタッフのうち、希望休・絶対休・有給申請・有給確定のいずれかを本人が
+    休日スタッフのうち、希望休・絶対休・有給申請のいずれかを本人が
     申請していた場合は赤文字＋太字とし、AIが自動割り当てした公休(通常の赤文字)
     と一目で区別できるようにする。
     """
@@ -1654,7 +1658,7 @@ def build_export_workbook(
     red_bold_font = Font(color="FF0000", bold=True)
     requested_off_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
-    # 希望休/絶対休/有給申請/有給確定のいずれかを本人が申請していた(氏名,日付)の集合。
+    # 希望休/絶対休/有給申請のいずれかを本人が申請していた(氏名,日付)の集合。
     # 該当する休日スタッフ名は赤文字＋太字にして、AI自動割り当ての公休と区別する。
     requested_off_pairs: set[tuple[str, dt.date]] = set()
     if requests_df is not None and not requests_df.empty:

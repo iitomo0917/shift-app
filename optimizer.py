@@ -12,8 +12,10 @@
   - 各店舗の「1日あたり社員は最大2名まで」「許可されたパターン以外の3〜4名体制は
     禁止」は、社員数の上限キャップ・店舗ごとの合計人数キャップとして真のハード制約
     (スラックなし)で表現する。これにより体制が勝手に膨らむことは構造的に発生しない。
-  - 定休日/絶対休/有給確定/最大6連勤/1日1店舗/店舗ごとの人員上限キャップのみは
-    真のハード制約として扱う。
+  - 定休日/絶対休/有給申請/最大6連勤/1日1店舗/店舗ごとの人員上限キャップのみは
+    真のハード制約として扱う。「有給申請」は「絶対休」と全く同様に扱う完全な
+    ハード制約であり(旧「有給確定」区分は廃止・統合済み)、希望休のみが唯一の
+    ソフト制約(希望)として残る。
 """
 
 from __future__ import annotations
@@ -33,13 +35,13 @@ W_SHORTAGE = 1000       # 店舗の必要人員(社員/パート組合せ)が満
 W_SKILL = 500           # 測定・加工スキル保有者が1人もいない
 W_SHOKUTAKU_MIN = 800   # 嘱託の期間内最低勤務日数を満たせない
 W_PART_RANGE = 700      # パートの期間内勤務日数が許容レンジ[min,max]を外れた
-W_HOLIDAY_DEV = 900     # 店長・正社員の出勤日数が規定(21日、有給確定者は20日等)から
+W_HOLIDAY_DEV = 900     # 店長・正社員の出勤日数が規定(21日、有給申請者は20日等)から
                         # 1日でもズレることへの重いペナルティ。店舗の必要人員/スキル要件
                         # (W_SHORTAGE/W_SKILL)には次ぐが、他の全てのソフト優先度
                         # (パート活用・嘱託ボーナス・優先店舗など)を確実に上回るよう、
                         # 意図的に高く設定している(=事実上のハード制約として機能させる)。
-W_SOFT_REQUEST = 15     # 希望休/有給申請を無視して出勤させた
-W_SOFT_REQUEST_PRIORITY = 40  # 有給取得可能日に申請された有給申請を無視した場合の重い罰則
+W_SOFT_REQUEST = 15     # 希望休を無視して出勤させた(唯一のソフト制約。有給申請は
+                        # 絶対休と同様の完全なハード制約のため、ここには登場しない)。
 W_HELP = 1              # 正社員が主所属以外の店舗に出た(ヘルプ)回数
 W_CONSEC5 = 3           # 嘱託が5連勤以上になった場合
 W_WEEKEND_MAX = 2       # 土日出勤の最大値(公平化)
@@ -155,7 +157,7 @@ def solve_shift(
     # --- 3. 定休日は全員休み(変数自体を作らないため自動的に満たされる) -------------
     #     (closed daysの変数は存在しない)
 
-    # --- 4. 絶対休・有給確定はハード制約 -----------------------------------
+    # --- 4. 絶対休・有給申請はハード制約 -----------------------------------
     hard_off_dates: dict[str, set] = {}
     soft_off_dates: dict[str, dict] = {}
     if not requests_df.empty:
@@ -406,21 +408,17 @@ def solve_shift(
             penalty_terms.append((skill_shortfall, W_SKILL))
             shortage_records[(d, store)].setdefault("vars", {})["スキル保有者不在"] = skill_shortfall
 
-    # --- 7. 希望休・有給申請(ソフト) -----------------------------------------
-    availability_df = utils.compute_paid_leave_availability(dates_df, staff_df, requests_df)
-    priority_dates = set(availability_df.loc[availability_df["paid_leave_slots"] > 0, "date"])
-
+    # --- 7. 希望休(ソフト) ---------------------------------------------------
+    #     現行の区分では希望休のみがソフト制約(SOFT_OFF_KINDS={"希望休"})。
+    #     有給申請は絶対休と同じハード制約(セクション4)として既に出勤枠が0に
+    #     固定されているため、このループに登場すること自体がない。
     for sid, date_kind_map in soft_off_dates.items():
         allowed = staff_allowed.get(sid, [])
         for d, kind in date_kind_map.items():
             expr = _day_work_expr(work_vars, sid, d, allowed)
             if isinstance(expr, int) and expr == 0:
                 continue
-            if kind == "有給申請" and d in priority_dates:
-                weight = W_SOFT_REQUEST_PRIORITY
-            else:
-                weight = W_SOFT_REQUEST
-            penalty_terms.append((expr, weight))
+            penalty_terms.append((expr, W_SOFT_REQUEST))
 
     # --- 8. 嘱託: 期間内勤務日数レンジ[min,max]の遵守(不足/超過はスラックで許容) --
     shokutaku_range_info: dict[str, tuple[cp_model.IntVar, cp_model.IntVar, int, int]] = {}
@@ -521,7 +519,7 @@ def solve_shift(
         if other_store_terms:
             penalty_terms.append((cp_model.LinearExpr.Sum(other_store_terms), W_PREFERRED_STORE))
 
-    # --- 11. 店長+正社員: 出勤日数を規定日数(21日/有給確定者は20日等)に厳格化 -----
+    # --- 11. 店長+正社員: 出勤日数を規定日数(21日/有給申請者は20日等)に厳格化 -----
     #     W_HOLIDAY_DEV を非常に重く設定しているため、事実上のハード制約として
     #     機能する(店舗人員・スキル要件のみを上回って優先される)。それでも数式上は
     #     スラック変数を介した制約のため、極端な休み希望の衝突があってもソルバーが
@@ -556,7 +554,7 @@ def solve_shift(
             confirmed_paid_leave = int(
                 (
                     (requests_df["staff_id"] == sid)
-                    & (requests_df["kind"] == "有給確定")
+                    & (requests_df["kind"] == "有給申請")
                     & (requests_df["date"].isin(business_days))
                 ).sum()
             )
@@ -669,7 +667,7 @@ def solve_shift(
                 for sid in staff_df["staff_id"]:
                     off_kind = None
                     if sid in hard_off_dates and d in hard_off_dates[sid]:
-                        off_kind = "絶対休/有給確定"
+                        off_kind = "絶対休/有給申請"
                     elif sid in soft_off_dates and d in soft_off_dates[sid]:
                         off_kind = soft_off_dates[sid][d]
                     if off_kind is None:
