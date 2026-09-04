@@ -258,11 +258,19 @@ def check_excel_export_styles(
         if not header_cell.font.bold:
             issues.append(f"{sheet_name}: 1行目が太字でない(既存スタイルが崩れている)")
 
-        height_check_end = header_and_store_rows_end if sheet_name == "店舗別日別シフト表" else 18
-        for r in range(1, height_check_end + 1):
-            h = ws.row_dimensions[r].height
-            if h != 39.0:
-                issues.append(f"{sheet_name}: {r}行目の行高が39pt(52px相当)でない(実際{h})")
+        if sheet_name == "店舗別日別シフト表":
+            h1 = ws.row_dimensions[1].height
+            if h1 != 39.0:
+                issues.append(f"{sheet_name}: 1行目の行高が39pt(52px相当)でない(実際{h1})")
+            for r in range(2, header_and_store_rows_end + 1):
+                h = ws.row_dimensions[r].height
+                if h != 28.5:
+                    issues.append(f"{sheet_name}: {r}行目の行高が28.5pt(38px相当)でない(実際{h})")
+        else:
+            for r in range(1, 19):
+                h = ws.row_dimensions[r].height
+                if h != 39.0:
+                    issues.append(f"{sheet_name}: {r}行目の行高が39pt(52px相当)でない(実際{h})")
 
         if sheet_name == "店舗別日別シフト表":
             for col_idx in range(2, 34):

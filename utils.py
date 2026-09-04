@@ -1820,12 +1820,14 @@ def build_export_workbook(
     for j in range(34, total_cols + 1):
         ws1.column_dimensions[get_column_letter(j)].width = 13
 
-    # 1行目(ヘッダー)〜店舗ブロック最終行(ヘッダー1行+7店舗×4枠=29行目)までの
-    # 行高を 52px相当(39pt)に統一する(店舗ブロックの行数を固定値で再計算せず、
-    # 実際に描画したEXCEL_STORE_SLOT_ROWS×STORES数から動的に導出する)。
-    header_and_store_rows_end = 1 + EXCEL_STORE_SLOT_ROWS * len(STORES)
-    for r in range(1, header_and_store_rows_end + 1):
-        ws1.row_dimensions[r].height = 39.0
+    # 1行目(ヘッダー)は 52px相当(39pt)、2行目〜店舗ブロック最終行(2行目+7店舗×
+    # 4枠-1=29行目)は 38px相当(28.5pt)に統一する(店舗ブロックの行数を固定値で
+    # 再計算せず、実際に描画したEXCEL_STORE_SLOT_ROWS×STORES数から動的に導出する)。
+    header_row_end = 1
+    store_rows_end = header_row_end + EXCEL_STORE_SLOT_ROWS * len(STORES)  # 2行目+28行=29行目
+    ws1.row_dimensions[1].height = 39.0
+    for r in range(2, store_rows_end + 1):
+        ws1.row_dimensions[r].height = 28.5
 
     ws1.freeze_panes = "B2"
     ws1.page_setup.orientation = "landscape"
