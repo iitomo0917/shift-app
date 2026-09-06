@@ -306,22 +306,41 @@ def default_staff_df() -> pd.DataFrame:
     df["preferred_off_date"] = None
 
     # 土日祝は特定の店舗への配置を禁止するスタッフ(ハード制約)。
-    #   若松: 検査技能不足のため土日祝の新蟹江店・名古屋中川店配置を禁止(平日のみ)。
+    #   若松: 検査技能不足のため土日祝の名古屋中川店配置を禁止(平日のみ)。
+    #        新蟹江店については、以前はここに含めた完全禁止だったが、他店舗の
+    #        シフトがどうしても埋まらない(=真の人員不足が生じる)場合に限り
+    #        配属を認めたいとの要望により、下のweekend_holiday_avoid_storesへ
+    #        移動した(完全禁止ではなく、重いペナルティ付きの「最終手段」に変更)。
     #   野道: 大治店の土日祝出勤を禁止(平日のみ稼働)。
     df["weekend_holiday_forbidden_stores"] = [[] for _ in range(len(df))]
     df.loc[df["name"] == "若松", "weekend_holiday_forbidden_stores"] = df.loc[
         df["name"] == "若松", "weekend_holiday_forbidden_stores"
-    ].apply(lambda _: ["新蟹江店", "名古屋中川店"])
+    ].apply(lambda _: ["名古屋中川店"])
     df.loc[df["name"] == "野道", "weekend_holiday_forbidden_stores"] = df.loc[
         df["name"] == "野道", "weekend_holiday_forbidden_stores"
     ].apply(lambda _: ["大治店"])
 
+    # 土日祝は「原則」特定の店舗への配置を避けたいが、他店舗の人員不足がどうしても
+    # 解消できない場合に限り配属を許容する、というソフト制約(重いペナルティ)。
+    # weekend_holiday_forbidden_stores(完全禁止・ハード制約)とは異なり、
+    # 真に必要な場合(=不足解消)にはソルバーが例外的にここへ配属できる。
+    #   若松: 検査技能の観点から新蟹江店は本来避けたいが、他店舗のシフトがどうしても
+    #        埋まらない場合の「最終手段」として配属を許容する(2026/9時点の要望)。
+    df["weekend_holiday_avoid_stores"] = [[] for _ in range(len(df))]
+    df.loc[df["name"] == "若松", "weekend_holiday_avoid_stores"] = df.loc[
+        df["name"] == "若松", "weekend_holiday_avoid_stores"
+    ].apply(lambda _: ["新蟹江店"])
+
     # 出勤日にできる限りこの店舗へ配属してほしい、というソフトな優先店舗。
     #   吉田: 天白植田店を優先配属(他店ヘルプはやむを得ない場合のみ軽微なペナルティ)。
     #   山岡: 主所属の稲沢店を最優先配属(竹内・若松等のヘルプより優先させる)。
+    #   尾澤: 主所属の名古屋中川店を優先配属。普段は名古屋中川店に留め、大治店への
+    #        振替(辻本+尾澤の組合せ)は他店舗の人員不足がどうしても解消できない
+    #        場合の「最終手段」としてのみ発動させたい(2026/9時点の要望)。
     df["preferred_store"] = None
     df.loc[df["name"] == "吉田", "preferred_store"] = "天白植田店"
     df.loc[df["name"] == "山岡", "preferred_store"] = "稲沢店"
+    df.loc[df["name"] == "尾澤", "preferred_store"] = "名古屋中川店"
 
     # 土曜・日曜(祝日は含まない)に限り特定の店舗への配置を禁止するスタッフ(ハード制約)。
     #   若松: 土日は大治店を優先配置とするため、残る稲沢店を禁止(=土日は大治店固定)。
@@ -700,6 +719,10 @@ def kyuka_requests_wide_to_long(
     """管理者用マトリクス表(編集後)を、申請一覧(長形式)へ変換する。
 
     空欄・未知の種別値は無視する(クラッシュしない)。
+    管理者編集用グリッドが色付き絵文字付きの表記(KYUKA_KIND_EMOJI_LABELS)で
+    渡された場合も、ここでプレーンな種別文字列(「希望休」等)へ正規化してから
+    判定・保存する(絵文字表記はあくまで編集画面の表示上の工夫であり、保存データ
+    には反映させないため)。
     """
     date_labels = kyuka_matrix_date_labels(dates_df)
     label_to_date = dict(zip(date_labels, dates_df["date"]))
@@ -712,6 +735,7 @@ def kyuka_requests_wide_to_long(
             continue
         for label in date_labels:
             val = str(r.get(label, "")).strip()
+            val = KYUKA_EMOJI_TO_KIND.get(val, val)
             if val not in REQUEST_KINDS:
                 continue
             rows.append({"staff_id": name_to_id[name], "name": name, "date": label_to_date[label], "kind": val})
@@ -1401,6 +1425,34 @@ def style_kyuka_wide_matrix(wide_df: pd.DataFrame):
         return f"color: {color}" if color else ""
 
     return wide_df.style.map(_color, subset=date_cols)
+
+
+# 「管理者モードで編集する」の編集用グリッド(st.data_editor)専用の表記。
+# st.data_editorはセルの文字色指定に対応していない(Styler・column_configの
+# いずれも編集モードには効かない)ため、代わりに色付き絵文字を選択肢の文字列
+# そのものに埋め込むことで、編集中も一目で区別できるようにする。
+# 保存されるデータ自体は従来通り「希望休」等のプレーンな文字列のまま変わらない
+# (下のKYUKA_EMOJI_TO_KINDで復元し、kyuka_requests_wide_to_long側で正規化する)。
+KYUKA_KIND_EMOJI_LABELS: dict[str, str] = {
+    "希望休": "🔵希望休",
+    "絶対休": "🟠絶対休",
+    "有給申請": "🩷有給申請",
+}
+KYUKA_EMOJI_TO_KIND: dict[str, str] = {v: k for k, v in KYUKA_KIND_EMOJI_LABELS.items()}
+
+
+def to_emoji_labeled_kyuka_wide(wide_df: pd.DataFrame) -> pd.DataFrame:
+    """管理者編集用マトリクス表の値を、色付き絵文字付きの表記に変換したコピーを返す。
+
+    BLANK_LABEL(「（空白）」)はそのまま。日付列のみが対象で、「スタッフ名」列は
+    変換しない。st.data_editorのSelectboxColumnに渡す表示専用のDataFrameを
+    作るために使う(実データ・保存値には影響しない)。
+    """
+    date_cols = [c for c in wide_df.columns if c != "スタッフ名"]
+    out = wide_df.copy()
+    for col in date_cols:
+        out[col] = out[col].map(lambda v: KYUKA_KIND_EMOJI_LABELS.get(v, v))
+    return out
 
 
 def manual_shift_date_labels(dates_df: pd.DataFrame) -> list[str]:

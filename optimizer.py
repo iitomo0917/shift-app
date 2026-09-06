@@ -40,11 +40,6 @@ W_HOLIDAY_DEV = 900     # 店長・正社員の出勤日数が規定(21日、有
                         # (W_SHORTAGE/W_SKILL)には次ぐが、他の全てのソフト優先度
                         # (パート活用・嘱託ボーナス・優先店舗など)を確実に上回るよう、
                         # 意図的に高く設定している(=事実上のハード制約として機能させる)。
-W_INAZAWA_PRIORITY = 950  # 稲沢店の配属優先順位(山岡>若松>真田>竹内)への違反。
-                        # 店舗の必要人員(W_SHORTAGE=1000)を満たせなくなるくらいなら
-                        # 優先順位を崩してでも人員を確保する方を優先しつつ、他の
-                        # ほぼ全てのソフト優先度(W_HOLIDAY_DEV=900含む)を上回るよう
-                        # 重く設定している(=通常は事実上のハード制約として機能する)。
 W_SOFT_REQUEST = 15     # 希望休を無視して出勤させた(唯一のソフト制約。有給申請は
                         # 絶対休と同様の完全なハード制約のため、ここには登場しない)。
 W_HELP = 1              # 正社員が主所属以外の店舗に出た(ヘルプ)回数
@@ -60,6 +55,19 @@ W_PART_BONUS = 5        # パート(尾澤/野道/柴田)が1日出勤するご�
 W_STORE_PATTERN_PREF = 5  # 店舗の平日体制パターンに関するソフトな優先度。
                           # 正の値=社員2名体制を優先(パート併用を軽く抑制)、
                           # 負の値=社員1名+パート体制を優先(パート併用を軽く推奨)。
+W_INAZAWA_PRIORITY = 50  # 稲沢店の優先順位(山岡>若松>真田>竹内)を破った場合。
+                         # 通常時は確実にこの順位を守らせたいが、他店舗の人員不足
+                         # (W_SHORTAGE=1000等)を解消するために優先者を動かす必要が
+                         # ある場合は、そちらを優先させるため、他の軽微なソフト優先度
+                         # (W_HELP・W_STORE_PATTERN_PREF等)より明確に強く、しかし
+                         # 真の人員不足系のペナルティよりは弱い値にしている。
+W_WEEKEND_HOLIDAY_AVOID = 50  # 土日祝に「原則避けたい店舗」(weekend_holiday_
+                         # avoid_stores、例: 若松の新蟹江店)へ配属した場合。
+                         # 完全禁止(weekend_holiday_forbidden_stores、ハード制約)
+                         # とは異なり、他店舗の人員不足がどうしても解消できない
+                         # 場合の最終手段として配属を許容したいため、W_INAZAWA_
+                         # PRIORITYと同様に「真の人員不足系のペナルティよりは弱いが、
+                         # 軽微なソフト優先度よりは明確に強い」値にしている。
 
 BIG_M = 10
 
@@ -231,24 +239,24 @@ def solve_shift(
                 if (sid, d, store) in work_vars:
                     model.Add(work_vars[(sid, d, store)] == 0)
 
-    # ソフト制約(ペナルティ付き)の重み付き変数を集約するリスト。4e以降の各
-    # セクションで随時追加していく(section 6以降でも使うため、ここで初期化する)。
     penalty_terms: list = []
+    shortage_records: dict[tuple, dict] = {}
 
     # --- 4e. 稲沢店における優先順位の制御(ソフト制約・重いペナルティ) -------------
     #     竹内・山岡・若松・真田が同一営業日に出勤する場合の稲沢店への配属優先度は
     #     「山岡 > 若松 > 真田 > 竹内」の順とする(数値が小さいほど高優先)。
     #     優先度の高いスタッフ hi と低いスタッフ lo の全ペアについて、
     #     「lo を稲沢店に配置し、かつ hi を稲沢店以外に配置する」という組み合わせに
-    #     違反フラグを立て、重いペナルティ(W_INAZAWA_PRIORITY)を課す。これにより
-    #     通常は事実上のハード制約として機能し、hi が出勤する日に lo が稲沢店へ
-    #     入るなら hi も稲沢店に入らざるを得なくなる(=優先度の高い者から順に
-    #     稲沢店の枠が割り当てられる)が、店舗の必要人員(W_SHORTAGE)等どうしても
-    #     優先せざるを得ない他の要件と衝突する極端なケースでは、ハード制約として
-    #     ソルバーをINFEASIBLEに追い込むのではなく、違反を許容して解を返す。
-    #     hi が休みの日はこの制約が自動的に無効化されるため、その日は lo が
-    #     稲沢店へ配置されることを問題なく許容する(=優先度の高い者が不在の日まで
-    #     枠を空けたままにする必要はない)。
+    #     ペナルティ(W_INAZAWA_PRIORITY)を課す。これにより通常時は優先度の高い者
+    #     から順に稲沢店の枠が割り当てられるが、hi を他店舗の人員不足解消のために
+    #     どうしても動かす必要がある場合は、より重いペナルティ(W_SHORTAGE等)の方が
+    #     優先され、lo が稲沢店に入ることを許容できる。
+    #
+    #     過去にこれをハード制約(model.Add(... <= 1))として実装していたが、
+    #     hi(例: 山岡)を他店舗の人員不足解消のためにヘルプへ出すと、この制約の
+    #     せいで lo(若松・真田・竹内)全員が稲沢店に入れなくなり、不足が稲沢店側へ
+    #     「移動」するだけでゼロにできない、という副作用が発覚したため、
+    #     ソフト制約(重いペナルティ)に変更した。
     INAZAWA_PRIORITY_ORDER = ["山岡", "若松", "真田", "竹内"]
     inazawa_priority_ids = [name_to_id[n] for n in INAZAWA_PRIORITY_ORDER if n in name_to_id]
     for hi_pos, sid_hi in enumerate(inazawa_priority_ids):
@@ -264,9 +272,30 @@ def solve_shift(
                 ]
                 if not hi_other_terms:
                     continue
-                viol = model.NewBoolVar(f"inazawa_priority_viol_{sid_hi}_{sid_lo}_{d.isoformat()}")
-                model.Add(lo_inazawa + cp_model.LinearExpr.Sum(hi_other_terms) <= 1 + viol)
-                penalty_terms.append((viol, W_INAZAWA_PRIORITY))
+                violation = model.NewBoolVar(f"inazawa_priority_violation_{sid_hi}_{sid_lo}_{d.isoformat()}")
+                model.Add(lo_inazawa + cp_model.LinearExpr.Sum(hi_other_terms) <= 1 + violation)
+                penalty_terms.append((violation, W_INAZAWA_PRIORITY))
+
+    # --- 4f. 土日祝の「原則避けたい店舗」への配属抑制(ソフト制約・重いペナルティ) ----
+    #     weekend_holiday_forbidden_stores(4b、ハード制約=完全禁止)とは別に、
+    #     weekend_holiday_avoid_stores は「原則避けたいが、他店舗の人員不足が
+    #     どうしても解消できない場合の最終手段として配属を許容する」store集合。
+    #     例: 若松の新蟹江店(検査技能の観点から本来避けたいが、完全禁止すると
+    #     他店舗の不足を解消できないケースがあるため、重いペナルティ付きで
+    #     「最終手段」としてのみ配属を許容する)。
+    for row in staff_df.itertuples():
+        avoid_stores = getattr(row, "weekend_holiday_avoid_stores", None) or []
+        if not avoid_stores:
+            continue
+        sid = row.staff_id
+        avoid_terms = [
+            work_vars[(sid, d, st)]
+            for d in weekend_holiday_days
+            for st in avoid_stores
+            if (sid, d, st) in work_vars
+        ]
+        if avoid_terms:
+            penalty_terms.append((cp_model.LinearExpr.Sum(avoid_terms), W_WEEKEND_HOLIDAY_AVOID))
 
     # --- 5. 最大6連勤(7日ウィンドウの合計<=6) --------------------------------
     for row in staff_df.itertuples():
@@ -279,8 +308,6 @@ def solve_shift(
                     expr_terms.append(_day_work_expr(work_vars, sid, d, effective_allowed[sid]))
             if expr_terms:
                 model.Add(cp_model.LinearExpr.Sum(expr_terms) <= 6)
-
-    shortage_records: dict[tuple, dict] = {}
 
     # --- 6. 店舗別 必要人員体制(不足はスラックで許容) ------------------------
     for d in business_days:
