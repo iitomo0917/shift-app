@@ -1373,6 +1373,35 @@ _EMP_TYPE_SORT_ORDER = {"店長": 0, "正社員": 1, "嘱託": 2, "パート": 3
 
 BLANK_LABEL = "（空白）"
 
+# 「管理者用 全体休暇マトリックス表」の閲覧モード(st.dataframe)で使う、
+# セルの値ごとの文字色。値の意味が一目で区別できるようにするための配色。
+KYUKA_CELL_TEXT_COLORS: dict[str, str] = {
+    BLANK_LABEL: "#B0B0B0",  # 未申請(空白): 薄いグレーで目立たなくする
+    "希望休": "#1565C0",     # 青
+    "絶対休": "#E07B00",     # オレンジ
+    "有給申請": "#D81B7A",   # ピンク
+}
+
+
+def style_kyuka_wide_matrix(wide_df: pd.DataFrame):
+    """管理者用マトリクス表(閲覧モード)に、値ごとの文字色を適用したStylerを返す。
+
+    st.dataframe はpandasのStylerをそのまま描画できるため、ここで文字色だけを
+    設定したStylerを組み立てる。対象は日付列のみ(「スタッフ名」列は対象外)。
+    なお、この配色は「管理者モードで編集する」チェックがOFFの閲覧表示にのみ
+    適用される。ONにした際に表示される st.data_editor(編集用グリッド)は、
+    Streamlit側の技術的な制約により、値に応じたセル文字色の指定に対応して
+    いない(pandas Styler・column_configのいずれも編集モードのセル文字色を
+    変更する手段を提供していない)ため、こちらは従来通りの表示となる。
+    """
+    date_cols = [c for c in wide_df.columns if c != "スタッフ名"]
+
+    def _color(val: str) -> str:
+        color = KYUKA_CELL_TEXT_COLORS.get(val)
+        return f"color: {color}" if color else ""
+
+    return wide_df.style.map(_color, subset=date_cols)
+
 
 def manual_shift_date_labels(dates_df: pd.DataFrame) -> list[str]:
     """手動編集テーブルの列見出し(営業日のみ)を返す。"""

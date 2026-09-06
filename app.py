@@ -416,7 +416,8 @@ with tab2:
 
     admin_mode = st.checkbox("管理者モードで編集する", key="kyuka_admin_mode")
     if not admin_mode:
-        st.dataframe(wide_matrix, width="stretch", height=400, hide_index=True)
+        styled_matrix = utils.style_kyuka_wide_matrix(wide_matrix)
+        st.dataframe(styled_matrix, width="stretch", height=400, hide_index=True)
     else:
         edited_matrix = st.data_editor(
             wide_matrix,
