@@ -113,7 +113,11 @@ def check_individual_restrictions(result, staff_df, dates_df) -> list[str]:
     wm_id = name_to_id.get("若松")
     if wm_id:
         wm_rows = result.shift_df[result.shift_df["staff_id"] == wm_id]
-        bad = wm_rows[wm_rows["date"].isin(wh_days) & wm_rows["store"].isin(["新蟹江店", "名古屋中川店"])]
+        # 名古屋中川店は引き続き完全禁止(ハード制約)。新蟹江店は「他店舗の人員
+        # 不足がどうしても解消できない場合の最終手段」としてペナルティ付きで
+        # 許容する方針に変更されたため、ここでは禁止対象から除外する
+        # (新蟹江店の頻度自体はcheck_weekend_holiday_avoid_is_soft_not_hardで検証する)。
+        bad = wm_rows[wm_rows["date"].isin(wh_days) & wm_rows["store"].isin(["名古屋中川店"])]
         for _, r in bad.iterrows():
             issues.append(f"若松: {r['date']} {r['store']}(土日祝配置禁止店舗)")
 
@@ -131,6 +135,53 @@ def check_individual_restrictions(result, staff_df, dates_df) -> list[str]:
         for _, r in bad3.iterrows():
             issues.append(f"中村: {r['date']} 稲沢店(禁止店舗)")
 
+    return issues
+
+
+def check_wakamatsu_shinkanie_soft_last_resort() -> list[str]:
+    """若松の土日祝・新蟹江店ルールが、完全禁止(ハード制約)ではなく「他店舗の
+    人員不足がどうしても解消できない場合の最終手段」というペナルティ付きの
+    ソフト制約になっていることを検証する。
+
+    utils.MANUAL_STORE_ASSIGNMENTS を使い、ある土日の新蟹江店へ若松を
+    強制配置する(=旧ハード制約であれば必ずINFEASIBLEになる組み合わせ)。
+    ソフト制約化されていれば、ペナルティを払いつつもFEASIBLEな解が返る。
+    """
+    issues = []
+    dates = utils.get_period_dates(2026, 9)
+    dates_df = utils.classify_days(dates)
+    staff_df = utils.default_staff_df()
+    requests_df = utils.default_requests_df()
+    weekend_days = [
+        d for d in dates_df.loc[dates_df["is_business_day"], "date"] if d.weekday() in (5, 6)
+    ]
+    if not weekend_days:
+        return ["検証用の土日データが対象期間に存在しない"]
+    target = weekend_days[0]
+
+    original = list(utils.MANUAL_STORE_ASSIGNMENTS)
+    utils.MANUAL_STORE_ASSIGNMENTS[:] = [
+        {"date": target, "store": "新蟹江店", "names": ["若松"], "exclude_others": False, "note": "test"},
+    ]
+    try:
+        closed_days = int((~dates_df["is_business_day"]).sum())
+        result = solve_shift(
+            dates_df, staff_df, requests_df, base_holiday_quota=closed_days + 1, time_limit_sec=60
+        )
+        if not result.is_feasible:
+            issues.append(
+                f"若松を{target}の新蟹江店へ強制配置するとINFEASIBLEになった"
+                "(ソフト制約化されていればFEASIBLEになるはず)"
+            )
+        else:
+            name_to_id = dict(zip(staff_df["name"], staff_df["staff_id"]))
+            wm_rows = result.shift_df[
+                (result.shift_df["staff_id"] == name_to_id["若松"]) & (result.shift_df["date"] == target)
+            ]
+            if wm_rows.empty or wm_rows.iloc[0]["store"] != "新蟹江店":
+                issues.append(f"若松が{target}の新蟹江店へ配置されていない(強制指定が反映されていない)")
+    finally:
+        utils.MANUAL_STORE_ASSIGNMENTS[:] = original
     return issues
 
 
@@ -636,6 +687,10 @@ def main():
     record(
         "3c. 稲沢店における若松優先配置(竹内=稲沢+若松=他店の禁止)",
         check_wakamatsu_takeuchi_inazawa_priority(result, staff_df),
+    )
+    record(
+        "3d. 若松の土日祝新蟹江店がソフト制約(最終手段)であること",
+        check_wakamatsu_shinkanie_soft_last_resort(),
     )
 
     record(
