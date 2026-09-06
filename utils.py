@@ -69,10 +69,17 @@ GENERAL_STORES = [s for s in STORES if s not in COMBO_STORE_PART_ROLES and s != 
 EMPLOYEE_TYPES = ["店長", "正社員", "嘱託"]
 
 # 店舗ごとの1日あたり最大人数キャップ(optimizer.pyのハード制約と一致させる)。
-# Excel出力のレイアウト(店舗ごとの表示行数)にも利用する。
+# これはソルバー側の実際の人員上限(2名/3名)であり、画面・Excelの表示行数とは
+# 別概念である(表示行数は下のSTORE_SLOT_ROWSを参照)。
 STORE_MAX_HEADCOUNT = {
     store: (3 if store in (TOKUSHIGE_STORE, "名古屋中川店", "天白植田店") else 2) for store in STORES
 }
+
+# 画面上の手動編集テーブル・Excelエクスポートの両方で、全7店舗を一律「4枠」表示に
+# 統一するための行数。実際の人員上限(STORE_MAX_HEADCOUNT、2名/3名)を超える枠は、
+# 繁忙日の応援スタッフ追加や玉突き調整の一時的な受け皿として空欄のまま表示される
+# (ソルバー側の店舗別人員上限キャップを変更するものではない)。
+STORE_SLOT_ROWS = 4
 
 # パートの役割ごとの、期間内(16日〜翌月15日)勤務日数の許容範囲 (min, max)
 # リソースを使い切らせすぎず、かつ最低限は稼働させるためのハード制約(重ペナルティ)。
@@ -337,22 +344,14 @@ REQUIRED_PAIR_WORKDAYS = [
 # させ、それ以外のスタッフは同日同店舗への配置を禁止する(=ロースターを完全固定)。
 # 必要人数に満たない指定の場合は、その分だけ不足スラックが立ち、不足アラートに
 # 反映される(ソルバーは落ちない)。対象期間に該当日が含まれない場合は無視される。
-MANUAL_STORE_ASSIGNMENTS = [
-    {
-        "date": dt.date(2026, 10, 10),
-        "store": "徳重店",
-        "names": ["中村", "山岡"],
-        "exclude_others": False,  # 必要人数(2名)は満たすため、パートの追加配置は妨げない
-        "note": "土日祝の社員2名要件を充足(中村+山岡を確定配置)",
-    },
-    {
-        "date": dt.date(2026, 10, 10),
-        "store": "稲沢店",
-        "names": ["生駒"],
-        "exclude_others": True,  # 2人目を無理に埋めず1名不足を意図的に許容する
-        "note": "生駒1名のみ配置。2人目は無理に埋めず1名不足を許容する。",
-    },
-]
+#
+# 過去に「2026/10/10の徳重店=中村+山岡、稲沢店=生駒1名のみ」という一時的な
+# デバッグ用の固定指定がここに入っていたが、その後追加した「稲沢店は山岡を
+# 最優先配置する」という優先順位ルールと矛盾する(山岡を強制的に徳重店へ
+# 送ってしまうため)ことが判明したため、恒久的な特例としては不適切と判断し
+# 破棄した。通常は空のままにしておき、特定日を手動で固定したい一時的な
+# 需要が生じた場合のみ、期間を区切って一時的に追加すること。
+MANUAL_STORE_ASSIGNMENTS: list[dict] = []
 
 
 def derive_allowed_stores(row) -> list[str]:
@@ -1387,8 +1386,11 @@ def build_manual_shift_wide(
 ) -> pd.DataFrame:
     """最適化結果(長形式)を、手動編集用のワイド形式(店舗×営業日、1セル1名)に変換する。
 
-    各店舗は STORE_MAX_HEADCOUNT 分の行(枠)を持ち、店舗別日別シフト表と同じ
-    レイアウトになる。空きセルは空文字列で表現する。
+    実際の店舗別人員上限(STORE_MAX_HEADCOUNT、2名または3名)に関わらず、全7店舗を
+    一律 STORE_SLOT_ROWS(4)枠で表示する(店舗別日別シフト表・Excel出力と同じ
+    レイアウト)。これにより、繁忙日の応援スタッフ追加や複数店舗間の玉突き調整の
+    一時的な受け皿として、通常の人員上限を超える枠も画面上でプルダウン編集できる。
+    空きセルは空文字列で表現する(表示時にBLANK_LABELへ変換される)。
     """
     business_days_df = dates_df[dates_df["is_business_day"]]
     dates = list(business_days_df["date"])
@@ -1396,7 +1398,7 @@ def build_manual_shift_wide(
 
     rows = []
     for store in STORES:
-        n_slots = STORE_MAX_HEADCOUNT.get(store, 2)
+        n_slots = STORE_SLOT_ROWS
         per_date_names: dict[dt.date, list[str]] = {}
         for d in dates:
             if shift_df.empty:
@@ -1718,7 +1720,9 @@ def build_export_workbook(
     # (印刷・現場配布時のレイアウトを店舗間で統一するための表示上の仕様であり、
     # ソルバー側の実際の店舗別人員上限キャップ(2名/3名)を変更するものではない)。
     # 実人数が4名に満たない店舗・日は、余った枠が自動的に空欄になる。
-    EXCEL_STORE_SLOT_ROWS = 4
+    # (画面上の手動編集テーブルと共通の定数 STORE_SLOT_ROWS を使用し、両者の
+    # 行数が食い違わないようにする)
+    EXCEL_STORE_SLOT_ROWS = STORE_SLOT_ROWS
 
     for idx, store in enumerate(STORES):
         n_rows = EXCEL_STORE_SLOT_ROWS

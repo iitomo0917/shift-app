@@ -226,34 +226,36 @@ def solve_shift(
                 if (sid, d, store) in work_vars:
                     model.Add(work_vars[(sid, d, store)] == 0)
 
-    # --- 4e. 稲沢店における若松・竹内・真田の優先度制御(ハード制約) ----------------
-    #     同一営業日に若松・竹内・真田が出勤する場合、「竹内または真田を稲沢店に
-    #     配置し、かつ若松を稲沢店以外に配置する」という組み合わせをそれぞれ禁止する。
-    #     これにより、若松が出勤する日に竹内・真田のどちらかが稲沢店へ入るなら
-    #     若松も稲沢店に入らざるを得なくなる(=事実上、若松が稲沢店へ最優先配置され、
-    #     竹内・真田は他店舗へ回る)。若松が休みの日は該当項が自動的に0になるため、
-    #     制約は実質的に無効化され、竹内・真田が稲沢店へ配置されることを許容する。
-    #     どちらか一方が休みの日も同様に自動的に無効化されるため、既存の若松の
-    #     土日祝配置禁止(4b)・純粋な土日の稲沢店配置禁止(4c)・竹内/真田のスキル・
-    #     移動可能店舗制約とも矛盾なく共存する(いずれも変数への追加の禁止であり、
-    #     ==1のような強制ではないため、既存のFEASIBLE解の探索可能性を損なわない)。
-    sid_wakamatsu = name_to_id.get("若松")
-    for rival_name in ("竹内", "真田"):
-        sid_rival = name_to_id.get(rival_name)
-        if not sid_wakamatsu or not sid_rival:
-            continue
-        for d in business_days:
-            rival_inazawa = work_vars.get((sid_rival, d, "稲沢店"))
-            if rival_inazawa is None:
-                continue
-            wakamatsu_other_terms = [
-                work_vars[(sid_wakamatsu, d, st)]
-                for st in effective_allowed[sid_wakamatsu]
-                if st != "稲沢店" and (sid_wakamatsu, d, st) in work_vars
-            ]
-            if not wakamatsu_other_terms:
-                continue
-            model.Add(rival_inazawa + cp_model.LinearExpr.Sum(wakamatsu_other_terms) <= 1)
+    # --- 4e. 稲沢店における優先順位の制御(ハード制約) ---------------------------
+    #     竹内・山岡・若松・真田が同一営業日に出勤する場合の稲沢店への配属優先度は
+    #     「山岡 > 若松 > 真田 > 竹内」の順とする(数値が小さいほど高優先)。
+    #     優先度の高いスタッフ hi と低いスタッフ lo の全ペアについて、
+    #     「lo を稲沢店に配置し、かつ hi を稲沢店以外に配置する」という組み合わせを
+    #     禁止する。これにより、hi が出勤する日に lo が稲沢店へ入るなら hi も
+    #     稲沢店に入らざるを得なくなる(=事実上、優先度の高い者から順に稲沢店の
+    #     枠が割り当てられ、余った枠だけが下位のスタッフに回る)。
+    #     hi が休みの日はこの制約が自動的に無効化されるため、その日は lo が
+    #     稲沢店へ配置されることを問題なく許容する(=優先度の高い者が不在の日まで
+    #     枠を空けたままにする必要はない)。同様に、既存の土日祝配置禁止(4b)・
+    #     純粋な土日の稲沢店配置禁止(4c)・各スタッフのスキル・移動可能店舗制約とも
+    #     矛盾なく共存する(いずれも変数への追加の禁止であり、==1のような強制では
+    #     ないため、既存のFEASIBLE解の探索可能性を損なわない)。
+    INAZAWA_PRIORITY_ORDER = ["山岡", "若松", "真田", "竹内"]
+    inazawa_priority_ids = [name_to_id[n] for n in INAZAWA_PRIORITY_ORDER if n in name_to_id]
+    for hi_pos, sid_hi in enumerate(inazawa_priority_ids):
+        for sid_lo in inazawa_priority_ids[hi_pos + 1 :]:
+            for d in business_days:
+                lo_inazawa = work_vars.get((sid_lo, d, "稲沢店"))
+                if lo_inazawa is None:
+                    continue
+                hi_other_terms = [
+                    work_vars[(sid_hi, d, st)]
+                    for st in effective_allowed[sid_hi]
+                    if st != "稲沢店" and (sid_hi, d, st) in work_vars
+                ]
+                if not hi_other_terms:
+                    continue
+                model.Add(lo_inazawa + cp_model.LinearExpr.Sum(hi_other_terms) <= 1)
 
     # --- 5. 最大6連勤(7日ウィンドウの合計<=6) --------------------------------
     for row in staff_df.itertuples():
