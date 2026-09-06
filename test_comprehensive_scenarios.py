@@ -124,21 +124,21 @@ def check_individual_off_day_preserved(shift_df: pd.DataFrame, staff_df: pd.Data
 def check_manual_shift_wide_structure(shift_df: pd.DataFrame, dates_df: pd.DataFrame, staff_df: pd.DataFrame) -> list[str]:
     """店舗別日別シフト表(手動編集用ワイド形式)の行構成・空欄処理・変換の健全性を検証する。
 
-    行数・枠番号は utils.STORE_MAX_HEADCOUNT(実際の店舗別上限人数の単一の真実の
-    情報源)から動的に導出する。7店舗中、上限3名(徳重店・名古屋中川店・
-    天白植田店)が3店舗、上限2名(稲沢店・大治店・新蟹江店・極楽店)が4店舗
-    という実際の店舗容量制約を反映するため、行数は3*3+4*2=17行になる。
+    行数・枠番号は utils.STORE_SLOT_ROWS(画面・Excel共通の表示上の行数、単一の
+    真実の情報源)から動的に導出する。実際の店舗別人員上限(STORE_MAX_HEADCOUNT、
+    2名または3名)に関わらず、全7店舗を一律STORE_SLOT_ROWS(4)枠で表示する仕様
+    のため、行数は7*4=28行になる。
     """
     issues = []
     wide = utils.build_manual_shift_wide(shift_df, dates_df)
 
-    expected_rows = sum(utils.STORE_MAX_HEADCOUNT.get(s, 2) for s in utils.STORES)
+    expected_rows = utils.STORE_SLOT_ROWS * len(utils.STORES)
     if len(wide) != expected_rows:
         issues.append(f"手動編集ワイド表の行数が想定と異なる(想定{expected_rows}行、実際{len(wide)}行)")
 
     for store in utils.STORES:
         sub = wide[wide["店舗"] == store]
-        expected_slots = list(range(1, utils.STORE_MAX_HEADCOUNT.get(store, 2) + 1))
+        expected_slots = list(range(1, utils.STORE_SLOT_ROWS + 1))
         actual_slots = sorted(sub["枠"].tolist())
         if actual_slots != expected_slots:
             issues.append(f"{store}: 枠番号が想定と異なる(想定{expected_slots}、実際{actual_slots})")
@@ -243,8 +243,7 @@ def check_excel_export_styles(
 
     issues = []
     n_date_cols = len(dates_df)
-    STORE_SLOT_ROWS = 4  # 全7店舗を一律4行(1〜4枠)で出力する仕様(utils.pyと同じ値)
-    header_and_store_rows_end = 1 + STORE_SLOT_ROWS * len(utils.STORES)  # ヘッダー1行+7店舗×4行=29行目
+    header_and_store_rows_end = 1 + utils.STORE_SLOT_ROWS * len(utils.STORES)  # ヘッダー1行+7店舗×4行=29行目
 
     for sheet_name in ["店舗別日別シフト表", "スタッフ別出勤一覧表"]:
         if sheet_name not in wb.sheetnames:
@@ -283,7 +282,7 @@ def check_excel_export_styles(
             row_cursor = 2
             for store in utils.STORES:
                 expected_store_at_row[row_cursor] = store
-                row_cursor += STORE_SLOT_ROWS
+                row_cursor += utils.STORE_SLOT_ROWS
             for row, expected_store in expected_store_at_row.items():
                 actual_store = ws.cell(row=row, column=1).value
                 if actual_store != expected_store:
