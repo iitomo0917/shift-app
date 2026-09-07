@@ -128,10 +128,12 @@ def is_weekend_or_holiday(d: dt.date) -> bool:
 
 
 DEFAULT_SPECIAL_CLOSURE_LABEL = "お盆・年末年始等"
+DEFAULT_FORCED_OPEN_LABEL = "臨時営業"
 
 def classify_days(
     dates: list[dt.date],
     special_closure_dates: list[dt.date] | dict[dt.date, str] | None = None,
+    forced_open_dates: list[dt.date] | dict[dt.date, str] | None = None,
 ) -> pd.DataFrame:
     """各日の曜日・定休日/特別営業/通常営業/特別休業日の区分を判定する。
 
@@ -148,12 +150,26 @@ def classify_days(
         辞書で理由を指定した日は、note列にその理由がそのまま反映される
         (例: 「特別休業(計画年休)」)。これは表示・Excel出力上の理由ラベルの
         違いにすぎず、いずれも解析対象の営業日からは除外される点は同じ。
+      - forced_open_dates で指定された日は、本来は定休日(毎週水曜・最終火曜
+        以外の火曜)であっても強制的に「臨時営業」として通常営業扱いにする
+        (=営業日として最適化・人員配置の対象に含まれるようになる)。
+        既に営業日(通常営業/特別営業(短縮))の日を指定しても何も変化しない。
+        special_closure_dates と同様、リストでも{日付: 理由}の辞書でも渡せる。
+        なお、同じ日が special_closure_dates にも指定されている場合は、
+        「全店一斉休業」の意思をより強い指示として扱い、special_closure が
+        最終的に優先される(=臨時営業の指定は上書きされて休業日になる)。
     """
     if isinstance(special_closure_dates, dict):
         special_labels = dict(special_closure_dates)
     else:
         special_labels = {d: DEFAULT_SPECIAL_CLOSURE_LABEL for d in (special_closure_dates or [])}
     special_set = set(special_labels.keys())
+
+    if isinstance(forced_open_dates, dict):
+        forced_open_labels = dict(forced_open_dates)
+    else:
+        forced_open_labels = {d: DEFAULT_FORCED_OPEN_LABEL for d in (forced_open_dates or [])}
+    forced_open_set = set(forced_open_labels.keys())
 
     # 期間内に登場しうる暦月それぞれの最終火曜日を事前計算
     months = sorted({(d.year, d.month) for d in dates})
@@ -172,11 +188,18 @@ def classify_days(
         else:
             day_type, hours, note = "通常営業", NORMAL_HOURS, ""
 
+        is_forced_open = False
+        if d in forced_open_set and day_type == "定休日":
+            reason = forced_open_labels.get(d) or DEFAULT_FORCED_OPEN_LABEL
+            day_type, hours, note = "臨時営業", NORMAL_HOURS, f"臨時営業({reason})"
+            is_forced_open = True
+
         is_special_closure = False
         if d in special_set and day_type != "定休日":
             reason = special_labels.get(d) or DEFAULT_SPECIAL_CLOSURE_LABEL
             day_type, hours, note = "特別休業日", "-", f"特別休業({reason})"
             is_special_closure = True
+            is_forced_open = False
 
         holiday_name = jpholiday.is_holiday_name(d) or ""
         rows.append(
@@ -191,6 +214,7 @@ def classify_days(
                 "is_weekend_or_holiday": is_weekend_or_holiday(d),
                 "holiday_name": holiday_name,
                 "is_special_closure": is_special_closure,
+                "is_forced_open": is_forced_open,
             }
         )
     return pd.DataFrame(rows)

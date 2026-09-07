@@ -54,6 +54,13 @@ def init_state():
         # {日付ラベル(例: "12/29(火)"): 理由文字列} の形で保持する。
         # 未設定の日は utils.DEFAULT_SPECIAL_CLOSURE_LABEL(汎用理由)を使う。
         st.session_state.special_closure_reasons = {}
+    if "forced_open_labels" not in st.session_state:
+        st.session_state.forced_open_labels = []
+    if "forced_open_reasons" not in st.session_state:
+        # 臨時営業日(本来は定休日だが営業する日)ごとの理由(例: 「棚卸し」「繁忙期」)。
+        # {日付ラベル: 理由文字列} の形で保持する。未設定の日は
+        # utils.DEFAULT_FORCED_OPEN_LABEL(汎用理由)を使う。
+        st.session_state.forced_open_reasons = {}
 
 
 init_state()
@@ -139,7 +146,30 @@ special_closure_map: dict = {
     for l in st.session_state.special_closure_labels
 }
 
-dates_df = utils.classify_days(period_dates, special_closure_dates=special_closure_map)
+# 臨時営業日(本来は定休日だが営業する日)の選択もTab1のウィジェットで行うが、
+# 同様にdates_dfの計算より前に値を読む必要がある。選択肢は「本来であれば
+# 定休日になる日」のみに絞るため、特別休業日等の指定を一切含めない素の週次
+# パターンだけで軽量に一度分類しておく。
+baseline_dates_df = utils.classify_days(period_dates)
+forced_open_candidates = [
+    (row.date, f"{row.date.month}/{row.date.day}({row.weekday_jp})")
+    for row in baseline_dates_df.itertuples()
+    if not row.is_business_day
+]
+forced_open_labels_all = [label for _, label in forced_open_candidates]
+forced_open_label_to_date = {label: d for d, label in forced_open_candidates}
+st.session_state.forced_open_labels = [l for l in st.session_state.forced_open_labels if l in forced_open_label_to_date]
+st.session_state.forced_open_reasons = {
+    l: r for l, r in st.session_state.forced_open_reasons.items() if l in st.session_state.forced_open_labels
+}
+forced_open_map: dict = {
+    forced_open_label_to_date[l]: st.session_state.forced_open_reasons.get(l, utils.DEFAULT_FORCED_OPEN_LABEL)
+    for l in st.session_state.forced_open_labels
+}
+
+dates_df = utils.classify_days(
+    period_dates, special_closure_dates=special_closure_map, forced_open_dates=forced_open_map
+)
 st.sidebar.markdown(f"**シフト期間:** {period_label}")
 
 # 対象期間(月度)を切り替えた場合、直前まで保持していた最適化結果は別の月度の
@@ -287,6 +317,47 @@ with tab1:
                 st.session_state.special_closure_reasons[label] = choice
 
     st.markdown("---")
+    st.subheader("臨時営業日（本来は定休日だが営業する日）の設定")
+    st.caption(
+        "毎週水曜・最終火曜以外の火曜など、本来は定休日となる日を臨時で営業日に"
+        "変更できます。指定した日は通常営業扱いとなり、店舗の必要人員・スタッフの"
+        "出勤対象に含まれます（定休日数からは除外されます）。"
+    )
+    st.multiselect(
+        "臨時営業日（本来は定休日 → 臨時で営業）",
+        options=forced_open_labels_all,
+        key="forced_open_labels",
+    )
+
+    if st.session_state.forced_open_labels:
+        st.caption("選択した日ごとに理由を設定できます（例: 棚卸し・繁忙期対応等）。理由は備考欄に反映されます。")
+        forced_open_reason_presets = ["棚卸し", "繁忙期対応", utils.DEFAULT_FORCED_OPEN_LABEL, "その他(自由入力)"]
+        for label in st.session_state.forced_open_labels:
+            current = st.session_state.forced_open_reasons.get(label, utils.DEFAULT_FORCED_OPEN_LABEL)
+            preset_options = (
+                forced_open_reason_presets if current in forced_open_reason_presets else [current] + forced_open_reason_presets
+            )
+            col_a, col_b = st.columns([1, 2])
+            with col_a:
+                st.markdown(f"**{label}**")
+            with col_b:
+                choice = st.selectbox(
+                    f"{label} の理由",
+                    options=preset_options,
+                    index=preset_options.index(current),
+                    key=f"forced_open_reason_choice_{label}",
+                    label_visibility="collapsed",
+                )
+                if choice == "その他(自由入力)":
+                    choice = st.text_input(
+                        f"{label} の理由(自由入力)",
+                        value="" if current in forced_open_reason_presets else current,
+                        key=f"forced_open_reason_text_{label}",
+                        label_visibility="collapsed",
+                    ) or utils.DEFAULT_FORCED_OPEN_LABEL
+                st.session_state.forced_open_reasons[label] = choice
+
+    st.markdown("---")
     st.subheader(f"営業日一覧 — {period_label}")
     show_df = dates_df.copy()
     show_df["date"] = show_df["date"].apply(lambda d: f"{d.month}/{d.day}")
@@ -303,11 +374,13 @@ with tab1:
     n_business = int(dates_df["is_business_day"].sum())
     n_short = int((dates_df["day_type"] == "特別営業(短縮)").sum())
     n_special = int(dates_df["is_special_closure"].sum())
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("通常営業日数", n_business - n_short)
+    n_forced_open = int(dates_df["is_forced_open"].sum())
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("通常営業日数", n_business - n_short - n_forced_open)
     c2.metric("特別営業(短縮)日数", n_short)
     c3.metric("定休日数(曜日定休)", n_closed - n_special)
     c4.metric("特別休業日数", n_special)
+    c5.metric("臨時営業日数", n_forced_open)
 
     st.markdown("---")
     st.subheader("有給休暇 取得可能日・人数枠の自動算出")
