@@ -684,24 +684,28 @@ def load_current_requests(year: int, month: int, staff_df: pd.DataFrame) -> pd.D
     return compute_current_requests_from_log(log_df, staff_df)
 
 
-def sync_admin_requests_edit(current_df: pd.DataFrame, edited_df: pd.DataFrame, path: str) -> None:
+def sync_admin_requests_edit(current_df: pd.DataFrame, edited_df: pd.DataFrame, path: str) -> int:
     """管理者によるマトリクス表の一括編集を、追記型ログへの差分追記に変換して保存する。
 
     `current_df`(編集前の集計状態)と`edited_df`(編集後の状態)を比較し、
     実際に値が変化した(スタッフ名, 日付)の組み合わせについてのみ新しいログ行
     (追加/変更は新種別、削除は「取消」)を追記する。変化のない申請には一切
     触れないため、この編集と同時に他のスタッフが送信した個別申請を巻き込んで
-    消してしまうことがない。
+    消してしまうことがない。変化がなければ何も追記せず0を返すため、呼び出し側は
+    毎回無条件に呼んでも安全(=保存ボタンを介さない自動保存にそのまま使える)。
 
     重要: `current_df` には、管理者が実際に編集を始めた時点のスナップショット
     (=マトリクス表を描画した際に使った状態)を渡すこと。この関数を呼ぶ直前に
     改めてディスクから最新状態を読み直して渡してはならない。読み直してしまうと、
     管理者が編集している間に他のスタッフが送信した新規申請が「編集前後で消えた
     差分」と誤認識され、取消として上書きされてしまう。
+
+    戻り値: 実際に追記したログ行数(=変化があったセル数)。
     """
     cur_map = {(r["name"], r["date"]): r["kind"] for _, r in current_df.iterrows()} if not current_df.empty else {}
     new_map = {(r["name"], r["date"]): r["kind"] for _, r in edited_df.iterrows()} if not edited_df.empty else {}
 
+    changed = 0
     for key in set(cur_map) | set(new_map):
         old_kind = cur_map.get(key)
         new_kind = new_map.get(key)
@@ -709,6 +713,8 @@ def sync_admin_requests_edit(current_df: pd.DataFrame, edited_df: pd.DataFrame, 
             continue
         name, date = key
         append_kyuka_request(name, date, new_kind if new_kind is not None else CANCELLED_REQUEST_TYPE, path)
+        changed += 1
+    return changed
 
 
 def clear_kyuka_log(path: str) -> None:

@@ -55,11 +55,10 @@ def init_state():
         # 未設定の日は utils.DEFAULT_SPECIAL_CLOSURE_LABEL(汎用理由)を使う。
         st.session_state.special_closure_reasons = {}
     if "forced_open_labels" not in st.session_state:
+        # 本来は定休日(毎週水曜・最終火曜以外の火曜)だが、今回は臨時で
+        # 営業する日(例: 年末年始明けの1/5・1/6)。
         st.session_state.forced_open_labels = []
     if "forced_open_reasons" not in st.session_state:
-        # 臨時営業日(本来は定休日だが営業する日)ごとの理由(例: 「棚卸し」「繁忙期」)。
-        # {日付ラベル: 理由文字列} の形で保持する。未設定の日は
-        # utils.DEFAULT_FORCED_OPEN_LABEL(汎用理由)を使う。
         st.session_state.forced_open_reasons = {}
 
 
@@ -146,24 +145,16 @@ special_closure_map: dict = {
     for l in st.session_state.special_closure_labels
 }
 
-# 臨時営業日(本来は定休日だが営業する日)の選択もTab1のウィジェットで行うが、
-# 同様にdates_dfの計算より前に値を読む必要がある。選択肢は「本来であれば
-# 定休日になる日」のみに絞るため、特別休業日等の指定を一切含めない素の週次
-# パターンだけで軽量に一度分類しておく。
-baseline_dates_df = utils.classify_days(period_dates)
-forced_open_candidates = [
-    (row.date, f"{row.date.month}/{row.date.day}({row.weekday_jp})")
-    for row in baseline_dates_df.itertuples()
-    if not row.is_business_day
+# 臨時営業日(本来は定休日だが今回だけ営業する日)も同じパターンで、Tab1の
+# ウィジェットより前にsession_stateから読み出す。
+st.session_state.forced_open_labels = [
+    l for l in st.session_state.forced_open_labels if l in special_closure_label_to_date
 ]
-forced_open_labels_all = [label for _, label in forced_open_candidates]
-forced_open_label_to_date = {label: d for d, label in forced_open_candidates}
-st.session_state.forced_open_labels = [l for l in st.session_state.forced_open_labels if l in forced_open_label_to_date]
 st.session_state.forced_open_reasons = {
     l: r for l, r in st.session_state.forced_open_reasons.items() if l in st.session_state.forced_open_labels
 }
 forced_open_map: dict = {
-    forced_open_label_to_date[l]: st.session_state.forced_open_reasons.get(l, utils.DEFAULT_FORCED_OPEN_LABEL)
+    special_closure_label_to_date[l]: st.session_state.forced_open_reasons.get(l, utils.DEFAULT_FORCED_OPEN_LABEL)
     for l in st.session_state.forced_open_labels
 }
 
@@ -317,21 +308,23 @@ with tab1:
                 st.session_state.special_closure_reasons[label] = choice
 
     st.markdown("---")
-    st.subheader("臨時営業日（本来は定休日だが営業する日）の設定")
+    st.subheader("臨時営業日（本来は定休日だが今回だけ営業する日）の設定")
     st.caption(
-        "毎週水曜・最終火曜以外の火曜など、本来は定休日となる日を臨時で営業日に"
-        "変更できます。指定した日は通常営業扱いとなり、店舗の必要人員・スタッフの"
-        "出勤対象に含まれます（定休日数からは除外されます）。"
+        "毎週水曜・最終火曜以外の火曜など、本来は定休日となる日を、今回だけ臨時で"
+        "通常営業(10:00〜19:00)にしたい場合に指定できます(例: 年末年始明けの"
+        "変則営業)。指定した日は通常の営業日と同様に扱われ、店舗の必要人員体制も"
+        "通常通り適用されます。特別休業日と同じ日を指定した場合は、こちらの"
+        "「営業する」が優先されます。"
     )
     st.multiselect(
-        "臨時営業日（本来は定休日 → 臨時で営業）",
-        options=forced_open_labels_all,
+        "臨時営業日（通常は定休日だが今回のみ営業）",
+        options=special_closure_labels_all,
         key="forced_open_labels",
     )
 
     if st.session_state.forced_open_labels:
-        st.caption("選択した日ごとに理由を設定できます（例: 棚卸し・繁忙期対応等）。理由は備考欄に反映されます。")
-        forced_open_reason_presets = ["棚卸し", "繁忙期対応", utils.DEFAULT_FORCED_OPEN_LABEL, "その他(自由入力)"]
+        st.caption("選択した日ごとに理由を設定できます（省略時は「臨時営業」）。")
+        forced_open_reason_presets = [utils.DEFAULT_FORCED_OPEN_LABEL, "年末年始明けの通常営業", "その他(自由入力)"]
         for label in st.session_state.forced_open_labels:
             current = st.session_state.forced_open_reasons.get(label, utils.DEFAULT_FORCED_OPEN_LABEL)
             preset_options = (
@@ -374,13 +367,11 @@ with tab1:
     n_business = int(dates_df["is_business_day"].sum())
     n_short = int((dates_df["day_type"] == "特別営業(短縮)").sum())
     n_special = int(dates_df["is_special_closure"].sum())
-    n_forced_open = int(dates_df["is_forced_open"].sum())
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("通常営業日数", n_business - n_short - n_forced_open)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("通常営業日数", n_business - n_short)
     c2.metric("特別営業(短縮)日数", n_short)
     c3.metric("定休日数(曜日定休)", n_closed - n_special)
     c4.metric("特別休業日数", n_special)
-    c5.metric("臨時営業日数", n_forced_open)
 
     st.markdown("---")
     st.subheader("有給休暇 取得可能日・人数枠の自動算出")
@@ -527,7 +518,8 @@ with tab2:
     )
     st.caption(
         "この表は個別申請フォームからの入力を自動集計したものです。"
-        "「管理者モードで編集する」をONにすると、セルを直接書き換えられます。"
+        "「管理者モードで編集する」をONにすると、セルを直接書き換えられます"
+        "（保存ボタンは不要で、セルを編集すると自動的に保存されます）。"
     )
 
     current_requests_df = st.session_state.requests_df
@@ -559,16 +551,17 @@ with tab2:
             height=400,
             key="kyuka_admin_matrix_editor",
         )
-        if st.button("💾 管理者による変更を保存", key="kyuka_admin_matrix_save"):
-            edited_long = utils.kyuka_requests_wide_to_long(edited_matrix, st.session_state.staff_df, dates_df)
-            # 差分の基準は、このマトリクス表を描画した時点のスナップショット
-            # (wide_matrixの元になったcurrent_requests_df)にする。ここで改めて
-            # ディスクを読み直すと、管理者が編集していた間に他のスタッフが送信
-            # した個別申請が「管理者が消した差分」と誤認識され、巻き込んで
-            # 消えてしまうため、あえて読み直さない。実際に値が変化したセルの
-            # 分だけが差分追記される。
-            utils.sync_admin_requests_edit(current_requests_df, edited_long, kyuka_log_path)
-            st.success("マトリクス表の変更を保存しました。")
+        # 保存ボタンは置かず、セルの編集を検知した時点で即座に自動保存する。
+        # 差分の基準は、このマトリクス表を描画した時点のスナップショット
+        # (wide_matrixの元になったcurrent_requests_df)にする。ここで改めて
+        # ディスクを読み直すと、管理者が編集していた間に他のスタッフが送信
+        # した個別申請が「管理者が消した差分」と誤認識され、巻き込んで
+        # 消えてしまうため、あえて読み直さない。実際に値が変化したセルの
+        # 分だけが差分追記される(=無編集時は毎回呼んでも安全な0件追記)。
+        edited_long = utils.kyuka_requests_wide_to_long(edited_matrix, st.session_state.staff_df, dates_df)
+        changed_count = utils.sync_admin_requests_edit(current_requests_df, edited_long, kyuka_log_path)
+        if changed_count > 0:
+            st.toast(f"✅ {changed_count}件のセル変更を自動保存しました。", icon="💾")
             st.rerun()
 
         st.markdown("---")
