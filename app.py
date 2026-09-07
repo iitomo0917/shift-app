@@ -128,6 +128,34 @@ special_closure_labels_all = [
     f"{d.month}/{d.day}({wd})" for d, wd in zip(period_dates, [utils.WEEKDAY_JP[d.weekday()] for d in period_dates])
 ]
 special_closure_label_to_date = dict(zip(special_closure_labels_all, period_dates))
+date_to_special_closure_label = {v: k for k, v in special_closure_label_to_date.items()}
+
+# 特別休業日・臨時営業日の設定は月度ごとに独立したファイルへ保存し、月度を
+# 切り替えても(別ブラウザ・別端末からのアクセスや再起動後でも)保持されるように
+# する(kyuka_requestsログと同じ設計思想)。対象月度が実際に変わった時だけ
+# ディスクから読み直す(=ウィジェットの通常操作のたびに毎回読み直すと、まだ
+# ディスクへ保存されていない直前の操作がウィジェットに反映される前に上書き
+# されてしまう不安定なループになるため)。
+if st.session_state.get("special_days_period") != (year, month):
+    _loaded_special_map, _loaded_forced_map = utils.load_special_days_settings(year, month)
+    st.session_state.special_closure_labels = [
+        date_to_special_closure_label[d] for d in _loaded_special_map if d in date_to_special_closure_label
+    ]
+    st.session_state.special_closure_reasons = {
+        date_to_special_closure_label[d]: r
+        for d, r in _loaded_special_map.items()
+        if d in date_to_special_closure_label
+    }
+    st.session_state.forced_open_labels = [
+        date_to_special_closure_label[d] for d in _loaded_forced_map if d in date_to_special_closure_label
+    ]
+    st.session_state.forced_open_reasons = {
+        date_to_special_closure_label[d]: r
+        for d, r in _loaded_forced_map.items()
+        if d in date_to_special_closure_label
+    }
+    st.session_state.special_days_period = (year, month)
+
 st.session_state.special_closure_labels = [
     l for l in st.session_state.special_closure_labels if l in special_closure_label_to_date
 ]
@@ -350,6 +378,24 @@ with tab1:
                     ) or utils.DEFAULT_FORCED_OPEN_LABEL
                 st.session_state.forced_open_reasons[label] = choice
 
+    # 現在の特別休業日・臨時営業日設定を、この月度専用のファイルへ即時保存する。
+    # ここまでのウィジェット(multiselect・理由selectbox)の処理を経た「今回の
+    # 再実行での最新値」を使って保存する(=サイドバー側で先に計算していた
+    # special_closure_map/forced_open_mapは、このTab1の処理より前に確定した
+    # 値のため、直前の理由変更等がまだ反映されておらず1手遅れてしまう。
+    # そのため、保存はこの位置で改めて最新のsession_stateから組み直す)。
+    _save_special_closure_map = {
+        special_closure_label_to_date[l]: st.session_state.special_closure_reasons.get(
+            l, utils.DEFAULT_SPECIAL_CLOSURE_LABEL
+        )
+        for l in st.session_state.special_closure_labels
+    }
+    _save_forced_open_map = {
+        special_closure_label_to_date[l]: st.session_state.forced_open_reasons.get(l, utils.DEFAULT_FORCED_OPEN_LABEL)
+        for l in st.session_state.forced_open_labels
+    }
+    utils.save_special_days_settings(year, month, _save_special_closure_map, _save_forced_open_map)
+
     st.markdown("---")
     st.subheader(f"営業日一覧 — {period_label}")
     show_df = dates_df.copy()
@@ -518,8 +564,7 @@ with tab2:
     )
     st.caption(
         "この表は個別申請フォームからの入力を自動集計したものです。"
-        "「管理者モードで編集する」をONにすると、セルを直接書き換えられます"
-        "（保存ボタンは不要で、セルを編集すると自動的に保存されます）。"
+        "「管理者モードで編集する」をONにすると、セルを直接書き換えられます。"
     )
 
     current_requests_df = st.session_state.requests_df
@@ -551,18 +596,27 @@ with tab2:
             height=400,
             key="kyuka_admin_matrix_editor",
         )
-        # 保存ボタンは置かず、セルの編集を検知した時点で即座に自動保存する。
-        # 差分の基準は、このマトリクス表を描画した時点のスナップショット
-        # (wide_matrixの元になったcurrent_requests_df)にする。ここで改めて
-        # ディスクを読み直すと、管理者が編集していた間に他のスタッフが送信
-        # した個別申請が「管理者が消した差分」と誤認識され、巻き込んで
-        # 消えてしまうため、あえて読み直さない。実際に値が変化したセルの
-        # 分だけが差分追記される(=無編集時は毎回呼んでも安全な0件追記)。
-        edited_long = utils.kyuka_requests_wide_to_long(edited_matrix, st.session_state.staff_df, dates_df)
-        changed_count = utils.sync_admin_requests_edit(current_requests_df, edited_long, kyuka_log_path)
-        if changed_count > 0:
-            st.toast(f"✅ {changed_count}件のセル変更を自動保存しました。", icon="💾")
+
+        # セルを書き換えた時点で即座にディスクへ保存する(自動保存)。
+        # 以前は「💾 保存」ボタンを押すまで確定しない仕様だったため、保存ボタンを
+        # 押す前に対象月のプルダウンを切り替えると、その未保存の編集内容が
+        # 失われてしまう問題があった。個別申請フォームと同様、セル変更を
+        # その場で確定保存することで、月を切り替えても編集内容が失われないよう
+        # にしている。
+        has_pending_edit = not edited_matrix[date_cols].equals(emoji_wide_matrix[date_cols])
+        if has_pending_edit:
+            edited_long_current = utils.kyuka_requests_wide_to_long(edited_matrix, st.session_state.staff_df, dates_df)
+            # 差分の基準は、このマトリクス表を描画した時点のスナップショット
+            # (wide_matrixの元になったcurrent_requests_df)にする。ここで改めて
+            # ディスクを読み直すと、管理者が編集していた間に他のスタッフが送信
+            # した個別申請が「管理者が消した差分」と誤認識され、巻き込んで
+            # 消えてしまうため、あえて読み直さない。実際に値が変化したセルの
+            # 分だけが差分追記される。
+            utils.sync_admin_requests_edit(current_requests_df, edited_long_current, kyuka_log_path)
+            st.toast("マトリクス表の変更を自動保存しました。", icon="💾")
             st.rerun()
+        else:
+            st.caption("✅ 表の内容はすべて保存済みです(セルを変更すると自動的に保存されます)。")
 
         st.markdown("---")
         if st.button("🗑️ 休暇データをリセット（この月度のみ・管理者操作）", key="reset_requests_button"):

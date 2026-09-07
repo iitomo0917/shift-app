@@ -150,14 +150,12 @@ def classify_days(
         辞書で理由を指定した日は、note列にその理由がそのまま反映される
         (例: 「特別休業(計画年休)」)。これは表示・Excel出力上の理由ラベルの
         違いにすぎず、いずれも解析対象の営業日からは除外される点は同じ。
-      - forced_open_dates で指定された日は、本来は定休日(毎週水曜・最終火曜
-        以外の火曜)であっても強制的に「臨時営業」として通常営業扱いにする
-        (=営業日として最適化・人員配置の対象に含まれるようになる)。
-        既に営業日(通常営業/特別営業(短縮))の日を指定しても何も変化しない。
-        special_closure_dates と同様、リストでも{日付: 理由}の辞書でも渡せる。
-        なお、同じ日が special_closure_dates にも指定されている場合は、
-        「全店一斉休業」の意思をより強い指示として扱い、special_closure が
-        最終的に優先される(=臨時営業の指定は上書きされて休業日になる)。
+      - forced_open_dates で指定された日は、本来は定休日(毎週水曜・最終火曜以外の
+        火曜)となる日であっても、強制的に「通常営業」(通常営業時間)として
+        営業日扱いにする(=年末年始明けに変則的に営業する、等のイレギュラー対応)。
+        special_closure_dates と forced_open_dates の両方に同じ日が含まれる場合は
+        forced_open_dates(営業する)を優先する。指定形式はspecial_closure_dates
+        と同様、日付リストまたは{日付: 理由}の辞書のいずれも渡せる。
     """
     if isinstance(special_closure_dates, dict):
         special_labels = dict(special_closure_dates)
@@ -188,18 +186,16 @@ def classify_days(
         else:
             day_type, hours, note = "通常営業", NORMAL_HOURS, ""
 
-        is_forced_open = False
-        if d in forced_open_set and day_type == "定休日":
-            reason = forced_open_labels.get(d) or DEFAULT_FORCED_OPEN_LABEL
-            day_type, hours, note = "臨時営業", NORMAL_HOURS, f"臨時営業({reason})"
-            is_forced_open = True
-
         is_special_closure = False
         if d in special_set and day_type != "定休日":
             reason = special_labels.get(d) or DEFAULT_SPECIAL_CLOSURE_LABEL
             day_type, hours, note = "特別休業日", "-", f"特別休業({reason})"
             is_special_closure = True
-            is_forced_open = False
+
+        if d in forced_open_set:
+            reason = forced_open_labels.get(d) or DEFAULT_FORCED_OPEN_LABEL
+            day_type, hours, note = "通常営業", NORMAL_HOURS, f"臨時営業({reason})"
+            is_special_closure = False
 
         holiday_name = jpholiday.is_holiday_name(d) or ""
         rows.append(
@@ -214,7 +210,6 @@ def classify_days(
                 "is_weekend_or_holiday": is_weekend_or_holiday(d),
                 "holiday_name": holiday_name,
                 "is_special_closure": is_special_closure,
-                "is_forced_open": is_forced_open,
             }
         )
     return pd.DataFrame(rows)
@@ -684,28 +679,24 @@ def load_current_requests(year: int, month: int, staff_df: pd.DataFrame) -> pd.D
     return compute_current_requests_from_log(log_df, staff_df)
 
 
-def sync_admin_requests_edit(current_df: pd.DataFrame, edited_df: pd.DataFrame, path: str) -> int:
+def sync_admin_requests_edit(current_df: pd.DataFrame, edited_df: pd.DataFrame, path: str) -> None:
     """管理者によるマトリクス表の一括編集を、追記型ログへの差分追記に変換して保存する。
 
     `current_df`(編集前の集計状態)と`edited_df`(編集後の状態)を比較し、
     実際に値が変化した(スタッフ名, 日付)の組み合わせについてのみ新しいログ行
     (追加/変更は新種別、削除は「取消」)を追記する。変化のない申請には一切
     触れないため、この編集と同時に他のスタッフが送信した個別申請を巻き込んで
-    消してしまうことがない。変化がなければ何も追記せず0を返すため、呼び出し側は
-    毎回無条件に呼んでも安全(=保存ボタンを介さない自動保存にそのまま使える)。
+    消してしまうことがない。
 
     重要: `current_df` には、管理者が実際に編集を始めた時点のスナップショット
     (=マトリクス表を描画した際に使った状態)を渡すこと。この関数を呼ぶ直前に
     改めてディスクから最新状態を読み直して渡してはならない。読み直してしまうと、
     管理者が編集している間に他のスタッフが送信した新規申請が「編集前後で消えた
     差分」と誤認識され、取消として上書きされてしまう。
-
-    戻り値: 実際に追記したログ行数(=変化があったセル数)。
     """
     cur_map = {(r["name"], r["date"]): r["kind"] for _, r in current_df.iterrows()} if not current_df.empty else {}
     new_map = {(r["name"], r["date"]): r["kind"] for _, r in edited_df.iterrows()} if not edited_df.empty else {}
 
-    changed = 0
     for key in set(cur_map) | set(new_map):
         old_kind = cur_map.get(key)
         new_kind = new_map.get(key)
@@ -713,8 +704,6 @@ def sync_admin_requests_edit(current_df: pd.DataFrame, edited_df: pd.DataFrame, 
             continue
         name, date = key
         append_kyuka_request(name, date, new_kind if new_kind is not None else CANCELLED_REQUEST_TYPE, path)
-        changed += 1
-    return changed
 
 
 def clear_kyuka_log(path: str) -> None:
@@ -852,6 +841,72 @@ def clear_saved_shift_result(shift_path: str = LATEST_SHIFT_PATH, meta_path: str
     for p in (shift_path, meta_path):
         if os.path.exists(p):
             os.remove(p)
+
+
+# ---------------------------------------------------------------------------
+# 特別休業日・臨時営業日設定のローカル永続化(月度ごと)
+# ---------------------------------------------------------------------------
+#
+# kyuka_requests(希望休・有休)は多数のスタッフが同時に個別申請しうるため
+# 追記型ログで安全に扱っているが、特別休業日・臨時営業日はTab1の管理者側の
+# カレンダー設定であり、shift結果(save_shift_result_to_disk)と同様に単純な
+# 上書き保存で十分(=同時編集の衝突リスクが低い)。月度ごとに独立したファイル
+# で管理し、他の月度のデータとは混ざらないようにする(kyuka_log_path_forと
+# 同じ設計)。
+
+
+def special_days_settings_path_for(year: int, month: int) -> str:
+    """月度別の特別休業日・臨時営業日設定の保存パスを返す。"""
+    return os.path.join(DATA_DIR, f"special_days_{int(year)}_{int(month):02d}.json")
+
+
+def save_special_days_settings(
+    year: int,
+    month: int,
+    special_closure_map: dict[dt.date, str],
+    forced_open_map: dict[dt.date, str],
+) -> None:
+    """指定月度の特別休業日・臨時営業日設定(日付→理由の辞書)をローカルへ即時保存する。
+
+    Tab1でのウィジェット操作のたびに呼び出すことで、最適化の実行や別タブへの
+    移動を挟んでも、また別ブラウザ・別端末からのアクセス時や再起動後でも、
+    月度を切り替えて戻ってくれば設定が保持される。
+    """
+    path = special_days_settings_path_for(year, month)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {
+        "special_closure": {d.isoformat(): r for d, r in special_closure_map.items()},
+        "forced_open": {d.isoformat(): r for d, r in forced_open_map.items()},
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+
+def load_special_days_settings(year: int, month: int) -> tuple[dict[dt.date, str], dict[dt.date, str]]:
+    """指定月度の特別休業日・臨時営業日設定を読み込む。
+
+    保存ファイルが無い/壊れている場合は (空辞書, 空辞書) を返す(クラッシュしない)。
+    """
+    path = special_days_settings_path_for(year, month)
+    if not os.path.exists(path):
+        return {}, {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return {}, {}
+
+    def _parse(section: str) -> dict[dt.date, str]:
+        result: dict[dt.date, str] = {}
+        for date_str, reason in (payload.get(section) or {}).items():
+            try:
+                d = dt.date.fromisoformat(date_str)
+            except (TypeError, ValueError):
+                continue
+            result[d] = reason
+        return result
+
+    return _parse("special_closure"), _parse("forced_open")
 
 
 def build_simple_staff_summary(
