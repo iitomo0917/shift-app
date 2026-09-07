@@ -604,10 +604,11 @@ def scenario_d_future_month_switching() -> None:
 
     months = [(2026, 9), (2026, 10), (2026, 11)]
     app_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py")
-    target_paths = [utils.kyuka_log_path_for(y, m) for y, m in months] + [
-        utils.LATEST_SHIFT_PATH,
-        utils.LATEST_SHIFT_META_PATH,
-    ]
+    target_paths = (
+        [utils.kyuka_log_path_for(y, m) for y, m in months]
+        + [utils.special_days_settings_path_for(y, m) for y, m in months]
+        + [utils.LATEST_SHIFT_PATH, utils.LATEST_SHIFT_META_PATH]
+    )
     backups: dict[str, bytes] = {}
     for p in target_paths:
         if os.path.exists(p):

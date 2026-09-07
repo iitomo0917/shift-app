@@ -520,15 +520,21 @@ def check_month_switch_no_crash_and_kyuka_isolation() -> list[str]:
     希望休データは新方式(追記型ログ)で管理されるため、「セッションの外側
     (=他ブラウザ・他端末を模した直接のログ追記)から届いた申請が、次の画面
     再描画で確実に反映される」ことも合わせて検証する。
+
+    (3) 特別休業日の選択・理由も月度ごとに独立したファイルへ保存され、他の
+    月度へ切り替えても、また元の月度に戻ってきても正しく保持される
+    (=セッション内で保持されるだけでなく、ディスク永続化されている)ことも
+    合わせて検証する。
     """
     issues = []
     # このチェックは実際の app.py (本番の data/ ディレクトリを参照) を通すため、
     # 既存の実運用データを壊さないよう、対象月度の保存ファイルを一時退避し、
     # 終了後に必ず元の内容へ復元する。
-    target_paths = [utils.kyuka_log_path_for(y, m) for y, m in [(2026, 9), (2026, 11)]] + [
-        utils.LATEST_SHIFT_PATH,
-        utils.LATEST_SHIFT_META_PATH,
-    ]
+    target_paths = (
+        [utils.kyuka_log_path_for(y, m) for y, m in [(2026, 9), (2026, 11)]]
+        + [utils.special_days_settings_path_for(y, m) for y, m in [(2026, 9), (2026, 11)]]
+        + [utils.LATEST_SHIFT_PATH, utils.LATEST_SHIFT_META_PATH]
+    )
     backups: dict[str, bytes] = {}
     for p in target_paths:
         if os.path.exists(p):
@@ -553,6 +559,18 @@ def check_month_switch_no_crash_and_kyuka_isolation() -> list[str]:
         if len(at.session_state["requests_df"]) != 1 or at.session_state["requests_df"].iloc[0]["name"] != "生駒":
             issues.append("ログへの直接追記が次の画面再描画で反映されない")
 
+        # 9月度で特別休業日を1件選択・理由を設定する(月度をまたいでも保持
+        # されることを、月度切り替え後に検証する)。
+        closure_ms = at.multiselect(key="special_closure_labels")
+        sept_closure_label = closure_ms.options[0]
+        closure_ms.set_value([sept_closure_label]).run()
+        if list(at.exception):
+            issues.append(f"特別休業日の選択で例外: {at.exception}")
+        reason_select = at.selectbox(key=f"special_closure_reason_choice_{sept_closure_label}")
+        reason_select.set_value("計画年休").run()
+        if list(at.exception):
+            issues.append(f"特別休業日の理由設定で例外: {at.exception}")
+
         month_selectbox = at.sidebar.selectbox[0]
         month_selectbox.select(11).run()
         if list(at.exception):
@@ -561,6 +579,8 @@ def check_month_switch_no_crash_and_kyuka_isolation() -> list[str]:
             issues.append("月度切り替え後もsolve_resultが古い月度のまま残っている")
         if len(at.session_state["requests_df"]) != 0:
             issues.append("月度切り替え後、希望休データが空になっていない(月度分離の不備)")
+        if at.session_state["special_closure_labels"]:
+            issues.append("11月度切り替え後も9月度の特別休業日選択が残っている(月度分離の不備)")
 
         tab3 = at.tabs[2]
         if not any("最適化を実行" in i.value for i in tab3.info):
@@ -573,6 +593,17 @@ def check_month_switch_no_crash_and_kyuka_isolation() -> list[str]:
         restored = at.session_state["requests_df"]
         if len(restored) != 1 or restored.iloc[0]["name"] != "生駒":
             issues.append(f"9月度に戻した際の希望休データが正しく復元されない(件数={len(restored)})")
+        if list(at.exception):
+            issues.append(f"9月度への復帰(特別休業日込み)で例外: {at.exception}")
+        restored_closure_labels = at.session_state["special_closure_labels"]
+        if restored_closure_labels != [sept_closure_label]:
+            issues.append(
+                f"9月度に戻した際の特別休業日選択が正しく復元されない"
+                f"(期待={[sept_closure_label]}, 実際={restored_closure_labels})"
+            )
+        restored_reason = at.session_state["special_closure_reasons"].get(sept_closure_label)
+        if restored_reason != "計画年休":
+            issues.append(f"9月度に戻した際の特別休業日の理由が正しく復元されない(実際={restored_reason})")
     finally:
         # 一時退避したファイルを元に戻す。テストが新規作成したファイル(ログ本体・
         # ロックファイル)のうち元々存在しなかったものは削除する。
@@ -709,7 +740,7 @@ def main():
     record("6c. 大量休み希望衝突時のクラッシュ非発生", check_heavy_conflict_no_crash())
     record("7a. check_manual_shift_alerts の異常入力耐性", check_manual_shift_alerts_robustness())
     record(
-        "7b. 月度切り替え時のクラッシュ非発生・希望休データ分離",
+        "7b. 月度切り替え時のクラッシュ非発生・希望休/特別休業日データの分離と保持",
         check_month_switch_no_crash_and_kyuka_isolation(),
     )
 
