@@ -49,6 +49,11 @@ def init_state():
             st.session_state.period = (2026, 9)
     if "special_closure_labels" not in st.session_state:
         st.session_state.special_closure_labels = []
+    if "special_closure_reasons" not in st.session_state:
+        # 特別休業日ごとの理由(例: 「年末年始」「計画年休」「希望休」)。
+        # {日付ラベル(例: "12/29(火)"): 理由文字列} の形で保持する。
+        # 未設定の日は utils.DEFAULT_SPECIAL_CLOSURE_LABEL(汎用理由)を使う。
+        st.session_state.special_closure_reasons = {}
 
 
 init_state()
@@ -120,9 +125,21 @@ special_closure_label_to_date = dict(zip(special_closure_labels_all, period_date
 st.session_state.special_closure_labels = [
     l for l in st.session_state.special_closure_labels if l in special_closure_label_to_date
 ]
-special_closure_dates = [special_closure_label_to_date[l] for l in st.session_state.special_closure_labels]
+# 理由(年末年始/計画年休/希望休 等)も同様に、選択されている日付ラベルの分だけを
+# 保持する(選択解除された日の理由設定は破棄する)。未設定の日はデフォルト理由。
+st.session_state.special_closure_reasons = {
+    l: r
+    for l, r in st.session_state.special_closure_reasons.items()
+    if l in st.session_state.special_closure_labels
+}
+special_closure_map: dict = {
+    special_closure_label_to_date[l]: st.session_state.special_closure_reasons.get(
+        l, utils.DEFAULT_SPECIAL_CLOSURE_LABEL
+    )
+    for l in st.session_state.special_closure_labels
+}
 
-dates_df = utils.classify_days(period_dates, special_closure_dates=special_closure_dates)
+dates_df = utils.classify_days(period_dates, special_closure_dates=special_closure_map)
 st.sidebar.markdown(f"**シフト期間:** {period_label}")
 
 # 対象期間(月度)を切り替えた場合、直前まで保持していた最適化結果は別の月度の
@@ -238,6 +255,36 @@ with tab1:
         options=special_closure_labels_all,
         key="special_closure_labels",
     )
+
+    if st.session_state.special_closure_labels:
+        st.caption(
+            "選択した日ごとに理由を設定できます（例: 年末年始・計画年休・希望休扱い等）。"
+            "理由はシフト表・Excel出力の「備考」欄にそのまま反映されます"
+            "（ソルバー上の扱い＝全スタッフ公休・営業枠0名、はどの理由でも共通です）。"
+        )
+        reason_presets = ["年末年始", "計画年休", "希望休", utils.DEFAULT_SPECIAL_CLOSURE_LABEL, "その他(自由入力)"]
+        for label in st.session_state.special_closure_labels:
+            current = st.session_state.special_closure_reasons.get(label, utils.DEFAULT_SPECIAL_CLOSURE_LABEL)
+            preset_options = reason_presets if current in reason_presets else [current] + reason_presets
+            col_a, col_b = st.columns([1, 2])
+            with col_a:
+                st.markdown(f"**{label}**")
+            with col_b:
+                choice = st.selectbox(
+                    f"{label} の理由",
+                    options=preset_options,
+                    index=preset_options.index(current),
+                    key=f"special_closure_reason_choice_{label}",
+                    label_visibility="collapsed",
+                )
+                if choice == "その他(自由入力)":
+                    choice = st.text_input(
+                        f"{label} の理由(自由入力)",
+                        value="" if current in reason_presets else current,
+                        key=f"special_closure_reason_text_{label}",
+                        label_visibility="collapsed",
+                    ) or utils.DEFAULT_SPECIAL_CLOSURE_LABEL
+                st.session_state.special_closure_reasons[label] = choice
 
     st.markdown("---")
     st.subheader(f"営業日一覧 — {period_label}")
@@ -419,12 +466,18 @@ with tab2:
         styled_matrix = utils.style_kyuka_wide_matrix(wide_matrix)
         st.dataframe(styled_matrix, width="stretch", height=400, hide_index=True)
     else:
+        st.caption(
+            "🔵希望休 / 🟠絶対休 / 🩷有給申請 　※文字色は変更できないため、"
+            "色付き絵文字で区別しています(保存される内容は従来通りです)。"
+        )
+        emoji_options = [utils.BLANK_LABEL] + list(utils.KYUKA_KIND_EMOJI_LABELS.values())
+        emoji_wide_matrix = utils.to_emoji_labeled_kyuka_wide(wide_matrix)
         edited_matrix = st.data_editor(
-            wide_matrix,
+            emoji_wide_matrix,
             column_config={
                 "スタッフ名": st.column_config.TextColumn("スタッフ名", disabled=True),
                 **{
-                    col: st.column_config.SelectboxColumn(col, options=[utils.BLANK_LABEL] + utils.REQUEST_KINDS)
+                    col: st.column_config.SelectboxColumn(col, options=emoji_options)
                     for col in date_cols
                 },
             },

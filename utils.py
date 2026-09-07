@@ -127,9 +127,11 @@ def is_weekend_or_holiday(d: dt.date) -> bool:
     return d.weekday() in (5, 6) or jpholiday.is_holiday(d)
 
 
+DEFAULT_SPECIAL_CLOSURE_LABEL = "お盆・年末年始等"
+
 def classify_days(
     dates: list[dt.date],
-    special_closure_dates: list[dt.date] | None = None,
+    special_closure_dates: list[dt.date] | dict[dt.date, str] | None = None,
 ) -> pd.DataFrame:
     """各日の曜日・定休日/特別営業/通常営業/特別休業日の区分を判定する。
 
@@ -138,11 +140,20 @@ def classify_days(
       - 火曜日: 「その暦月の最終火曜日」のみ特別営業(10-17時)、それ以外は定休日
       - 上記以外: 通常営業(10-19時)
       - special_closure_dates で指定された日(お盆・年末年始等の任意の全店一斉休業日)は、
-        通常なら営業日となる日を強制的に「特別休業日」として休業扱いにする
-        (=公休日数の計算式に「特別休業日数」として別枠で加算される)。
-        既に定休日の日を指定しても二重カウントはしない。
+        通常なら営業日(最終火曜日の短縮営業を含む)となる日であっても強制的に
+        「特別休業日」として休業扱いにする(=公休日数の計算式に「特別休業日数」
+        として別枠で加算される)。既に定休日の日を指定しても二重カウントはしない。
+      - special_closure_dates はリスト(全日「お盆・年末年始等」という汎用理由になる)
+        でも、{日付: 理由}の辞書(例: {date(2026,12,31): "計画年休"})でも渡せる。
+        辞書で理由を指定した日は、note列にその理由がそのまま反映される
+        (例: 「特別休業(計画年休)」)。これは表示・Excel出力上の理由ラベルの
+        違いにすぎず、いずれも解析対象の営業日からは除外される点は同じ。
     """
-    special_set = set(special_closure_dates or [])
+    if isinstance(special_closure_dates, dict):
+        special_labels = dict(special_closure_dates)
+    else:
+        special_labels = {d: DEFAULT_SPECIAL_CLOSURE_LABEL for d in (special_closure_dates or [])}
+    special_set = set(special_labels.keys())
 
     # 期間内に登場しうる暦月それぞれの最終火曜日を事前計算
     months = sorted({(d.year, d.month) for d in dates})
@@ -163,7 +174,8 @@ def classify_days(
 
         is_special_closure = False
         if d in special_set and day_type != "定休日":
-            day_type, hours, note = "特別休業日", "-", "特別休業(お盆・年末年始等)"
+            reason = special_labels.get(d) or DEFAULT_SPECIAL_CLOSURE_LABEL
+            day_type, hours, note = "特別休業日", "-", f"特別休業({reason})"
             is_special_closure = True
 
         holiday_name = jpholiday.is_holiday_name(d) or ""
