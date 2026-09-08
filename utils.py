@@ -384,6 +384,30 @@ def default_staff_df() -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------------------
+# スタッフ名簿の永続化(Googleスプレッドシート)
+# ---------------------------------------------------------------------------
+
+def load_staff_roster() -> pd.DataFrame | None:
+    """Googleスプレッドシートに保存済みのスタッフ名簿を読み込む。
+
+    保存データが無い/接続エラーの場合は None を返す
+    (呼び出し側は default_staff_df() にフォールバックすること)。
+    """
+    try:
+        return sheets_store.load_staff_roster()
+    except Exception:
+        return None
+
+
+def save_staff_roster(staff_df: pd.DataFrame) -> None:
+    """スタッフ名簿をGoogleスプレッドシートへ保存する。"""
+    try:
+        sheets_store.save_staff_roster(staff_df)
+    except Exception:
+        pass
+
+
 # 期間内に最低1回は特定の2名を同一店舗で同日勤務させる、という組み合わせ要件。
 # (不足時はソルバーを落とさず重いペナルティで警告するソフト化ハード制約)
 REQUIRED_PAIR_WORKDAYS = [
@@ -545,84 +569,76 @@ KYUKA_LOG_COLUMNS = ["staff_name", "date", "request_type", "updated_at"]
 CANCELLED_REQUEST_TYPE = "取消"  # ログ上の取消(論理削除)マーカー
 
 
-def kyuka_log_path_for(year: int, month: int) -> str:
-    """月度別の希望休・有休「追記型ログ」の保存パスを返す。"""
-    return os.path.join(DATA_DIR, f"kyuka_requests_{int(year)}_{int(month):02d}.csv")
+# 注記: 以前はここに、月度別ローカルCSV/JSONファイルへ保存する実装
+# (kyuka_log_path_for・special_days_path_for・ファイルロック・
+# append_kyuka_request等)があったが、Streamlit Community Cloudはアプリの
+# 再起動・再デプロイのたびにローカルファイルシステムへの書き込みを全て
+# 消去してしまう(=永続化されない)ことが確認されたため、Googleスプレッド
+# シートへ保存する方式(sheets_store.py)に置き換えた。以下の関数群は、
+# 同名の関数として引き続き呼び出せるが、内部ではsheets_store経由でGoogle
+# スプレッドシートを読み書きする。
+
+import sheets_store
 
 
-def _kyuka_lock_path(path: str) -> str:
-    return path + ".lock"
+def _sheets_setup_error(exc: Exception) -> str:
+    return (
+        "Googleスプレッドシートへの接続に失敗しました。Secretsの設定"
+        "([gcp_service_account]・spreadsheet_url)をご確認ください。"
+        f"(詳細: {exc})"
+    )
 
 
-def _acquire_kyuka_lock(path: str, timeout_sec: float = 5.0, poll_interval: float = 0.02) -> None:
-    """簡易な排他ロック(ロックファイル方式)を取得する。
+def load_special_days(year: int, month: int) -> tuple[dict[dt.date, str], dict[dt.date, str]]:
+    """指定月度の特別休業日・臨時営業日の設定を、Googleスプレッドシートから読み込む。
 
-    追記自体はOS上ほぼアトミックだが、ヘッダー行の初回書き込みと本体行の
-    追記を1つの操作として直列化するため、念のためロックで保護する。
-    タイムアウトした場合は、異常終了で残った古いロックとみなして強制解放し、
-    保存処理自体が止まってしまわないようにする(可用性を優先)。
+    未設定・接続エラーの場合は、両方とも空の辞書(=何も指定なし)を返す
+    (アプリ全体をクラッシュさせないための安全側フォールバック)。
     """
-    lock_path = _kyuka_lock_path(path)
-    deadline = time.time() + timeout_sec
-    while True:
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-            return
-        except FileExistsError:
-            if time.time() > deadline:
-                try:
-                    os.remove(lock_path)
-                except OSError:
-                    pass
-                continue
-            time.sleep(poll_interval)
-
-
-def _release_kyuka_lock(path: str) -> None:
     try:
-        os.remove(_kyuka_lock_path(path))
-    except OSError:
-        pass
-
-
-def append_kyuka_request(staff_name: str, date: dt.date, request_type: str, path: str) -> None:
-    """個別の希望休・有給申請(または取消)を1件、ログCSVへ追記する。
-
-    既存行の読み込み・書き換えを一切行わないため、他のスタッフが同時に別の
-    申請を送信していても、互いのデータを消去することがない。
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    _acquire_kyuka_lock(path)
-    try:
-        file_is_new = not os.path.exists(path) or os.path.getsize(path) == 0
-        with open(path, "a", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            if file_is_new:
-                writer.writerow(KYUKA_LOG_COLUMNS)
-            writer.writerow(
-                [
-                    staff_name,
-                    date.isoformat() if isinstance(date, dt.date) else str(date),
-                    request_type,
-                    dt.datetime.now().isoformat(timespec="seconds"),
-                ]
-            )
-    finally:
-        _release_kyuka_lock(path)
-
-
-def load_kyuka_log(path: str) -> pd.DataFrame:
-    """ログCSVの全行(履歴・取消行を含む)をそのまま読み込む。"""
-    if not os.path.exists(path):
-        return pd.DataFrame(columns=KYUKA_LOG_COLUMNS)
-    try:
-        df = pd.read_csv(path, dtype=str, encoding="utf-8-sig")
+        df = sheets_store.load_special_days_all()
     except Exception:
-        return pd.DataFrame(columns=KYUKA_LOG_COLUMNS)
+        return {}, {}
     if df.empty:
-        return pd.DataFrame(columns=KYUKA_LOG_COLUMNS)
-    return df.reindex(columns=KYUKA_LOG_COLUMNS)
+        return {}, {}
+    df = df[(df["year"].astype(str) == str(year)) & (df["month"].astype(str) == str(month))]
+    special_closure_map: dict[dt.date, str] = {}
+    forced_open_map: dict[dt.date, str] = {}
+    for _, r in df.iterrows():
+        try:
+            d = dt.date.fromisoformat(r["date"])
+        except (TypeError, ValueError):
+            continue
+        if r["category"] == "special_closure":
+            special_closure_map[d] = r["reason"]
+        elif r["category"] == "forced_open":
+            forced_open_map[d] = r["reason"]
+    return special_closure_map, forced_open_map
+
+
+def save_special_days(
+    year: int,
+    month: int,
+    special_closure_map: dict[dt.date, str],
+    forced_open_map: dict[dt.date, str],
+) -> None:
+    """指定月度の特別休業日・臨時営業日の設定をGoogleスプレッドシートへ保存する。"""
+    sheets_store.save_special_days(year, month, special_closure_map, forced_open_map)
+
+
+def append_kyuka_request(staff_name: str, date: dt.date, request_type: str, _period_key: str | None = None) -> None:
+    """個別の希望休・有給申請(または取消)を1件、Googleスプレッドシートのログへ追記する。
+
+    `_period_key` は旧ローカルファイル方式の名残の引数で、Sheets方式では
+    使用しない(全期間共通の1シートに保存するため)。既存の呼び出し箇所を
+    変更せずに済むよう、互換性のために引数だけ残してある。
+    """
+    sheets_store.append_kyuka_request(staff_name, date, request_type)
+
+
+def load_kyuka_log() -> pd.DataFrame:
+    """ログの全行(履歴・取消行を含む)をそのまま読み込む。"""
+    return sheets_store.load_kyuka_log()
 
 
 def compute_current_requests_from_log(log_df: pd.DataFrame, staff_df: pd.DataFrame) -> pd.DataFrame:
@@ -661,25 +677,20 @@ def compute_current_requests_from_log(log_df: pd.DataFrame, staff_df: pd.DataFra
 
 
 def load_current_requests(year: int, month: int, staff_df: pd.DataFrame) -> pd.DataFrame:
-    """指定月度の「現在有効な」希望休・有休一覧を、追記型ログから再構築して返す。
+    """指定月度の「現在有効な」希望休・有休一覧を、Googleスプレッドシート上の
 
-    新方式のログファイルがまだ存在しない場合は、旧方式(全体上書き保存)の
-    保存済みファイルが残っていればログへ1回だけ移行し(データを失わないため)、
-    以降はログを正としてこの関数から状態を再構築する。
+    追記型ログ(全期間共通・1シート)から再構築して返す。ログは全期間分が
+    1つのシートにまとまっているため、集計後に指定月度の日付だけへ絞り込む。
     """
-    log_path = kyuka_log_path_for(year, month)
-    if not os.path.exists(log_path):
-        legacy_path = saved_kyuka_path_for(year, month)
-        if os.path.exists(legacy_path):
-            legacy_df = load_requests_from_disk(path=legacy_path)
-            for _, r in legacy_df.iterrows():
-                append_kyuka_request(r["name"], r["date"], r["kind"], log_path)
-
-    log_df = load_kyuka_log(log_path)
-    return compute_current_requests_from_log(log_df, staff_df)
+    log_df = load_kyuka_log()
+    current_df = compute_current_requests_from_log(log_df, staff_df)
+    if current_df.empty:
+        return current_df
+    period_dates = set(get_period_dates(year, month))
+    return current_df[current_df["date"].isin(period_dates)].reset_index(drop=True)
 
 
-def sync_admin_requests_edit(current_df: pd.DataFrame, edited_df: pd.DataFrame, path: str) -> None:
+def sync_admin_requests_edit(current_df: pd.DataFrame, edited_df: pd.DataFrame, path: str | None = None) -> None:
     """管理者によるマトリクス表の一括編集を、追記型ログへの差分追記に変換して保存する。
 
     `current_df`(編集前の集計状態)と`edited_df`(編集後の状態)を比較し、
@@ -706,13 +717,20 @@ def sync_admin_requests_edit(current_df: pd.DataFrame, edited_df: pd.DataFrame, 
         append_kyuka_request(name, date, new_kind if new_kind is not None else CANCELLED_REQUEST_TYPE, path)
 
 
-def clear_kyuka_log(path: str) -> None:
-    """指定月度の希望休・有休ログを削除する(リセット機能用)。"""
-    if os.path.exists(path):
-        os.remove(path)
-    lock_path = _kyuka_lock_path(path)
-    if os.path.exists(lock_path):
-        os.remove(lock_path)
+def clear_kyuka_log(current_df: pd.DataFrame, _path: str | None = None) -> None:
+    """指定月度の「現在有効な」希望休・有休申請をすべて取消にする(リセット機能用)。
+
+    ログ自体は追記型でGoogleスプレッドシート上にすべての履歴を保持しているため、
+    ここでは`current_df`(リセット対象期間の現在有効な申請一覧)に含まれる
+    各(スタッフ名, 日付)について「取消」ログ行を追記する形で実現する
+    (過去の履歴は消さず、監査ログとして残す)。
+
+    `_path` は旧ローカルファイル方式の名残の引数で、Sheets方式では使用しない。
+    """
+    if current_df is None or current_df.empty:
+        return
+    active_requests = [(r["name"], r["date"]) for _, r in current_df.iterrows()]
+    sheets_store.clear_kyuka_requests_in_range(active_requests)
 
 
 def kyuka_matrix_date_labels(dates_df: pd.DataFrame) -> list[str]:
@@ -774,139 +792,44 @@ def kyuka_requests_wide_to_long(
 
 
 # ---------------------------------------------------------------------------
-# 最適化結果・手動編集シフトのローカル永続化
+# 最適化結果・手動編集シフトの永続化(Googleスプレッドシート)
 # ---------------------------------------------------------------------------
+# 以前はここにローカルCSV/JSONファイルへ保存する実装があったが、Streamlit
+# Community Cloudはアプリの再起動・再デプロイのたびにローカルファイルシステム
+# への書き込みを全て消去してしまうため、Googleスプレッドシートへ保存する方式
+# (sheets_store.py)に置き換えた。関数名・シグネチャは可能な限り維持している。
 
-LATEST_SHIFT_PATH = os.path.join(DATA_DIR, "latest_shift_result.csv")
-LATEST_SHIFT_META_PATH = os.path.join(DATA_DIR, "latest_shift_meta.json")
 
-
-def save_shift_result_to_disk(
-    shift_df: pd.DataFrame,
-    meta: dict,
-    shift_path: str = LATEST_SHIFT_PATH,
-    meta_path: str = LATEST_SHIFT_META_PATH,
-) -> None:
-    """最適化結果(または手動編集後の最新シフト)をローカルへ即時保存する。
+def save_shift_result_to_disk(shift_df: pd.DataFrame, meta: dict, *args, **kwargs) -> None:
+    """最適化結果(または手動編集後の最新シフト)をGoogleスプレッドシートへ即時保存する。
 
     最適化の実行完了時・手動編集の確定時・リセット時のいずれからも呼び出すことで、
     ブラウザを閉じたり別ブラウザ/別端末からアクセスした場合でも復元できる。
     """
-    os.makedirs(os.path.dirname(shift_path), exist_ok=True)
-    out = shift_df.copy()
-    if not out.empty:
-        out["date"] = out["date"].apply(lambda d: d.isoformat() if isinstance(d, dt.date) else d)
-    out.reindex(columns=["date", "store", "staff_id", "name", "emp_type"]).to_csv(
-        shift_path, index=False, encoding="utf-8-sig"
-    )
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False)
-
-
-def load_shift_result_from_disk(
-    shift_path: str = LATEST_SHIFT_PATH,
-    meta_path: str = LATEST_SHIFT_META_PATH,
-) -> tuple[pd.DataFrame | None, dict]:
-    """ローカル保存済みの最新シフト結果とメタ情報を読み込む。
-
-    保存ファイルが無い/壊れている場合は (None, {}) を返す(クラッシュしない)。
-    """
-    if not os.path.exists(shift_path):
-        return None, {}
     try:
-        df = pd.read_csv(
-            shift_path,
-            dtype={"staff_id": str, "name": str, "store": str, "emp_type": str},
-            encoding="utf-8-sig",
-        )
+        sheets_store.save_shift_result(shift_df, meta)
+    except Exception:
+        # 保存失敗時もアプリ全体はクラッシュさせない(画面上の状態は保持される)。
+        pass
+
+
+def load_shift_result_from_disk(*args, **kwargs) -> tuple[pd.DataFrame | None, dict]:
+    """Googleスプレッドシートに保存済みの最新シフト結果とメタ情報を読み込む。
+
+    保存データが無い/接続エラーの場合は (None, {}) を返す(クラッシュしない)。
+    """
+    try:
+        return sheets_store.load_shift_result()
     except Exception:
         return None, {}
-    if not df.empty and "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-        df = df.dropna(subset=["date"])
-    df = df.reindex(columns=["date", "store", "staff_id", "name", "emp_type"])
-
-    meta: dict = {}
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-        except Exception:
-            meta = {}
-    return df, meta
 
 
-def clear_saved_shift_result(shift_path: str = LATEST_SHIFT_PATH, meta_path: str = LATEST_SHIFT_META_PATH) -> None:
-    """ローカル保存済みの最新シフト結果を削除する。"""
-    for p in (shift_path, meta_path):
-        if os.path.exists(p):
-            os.remove(p)
-
-
-# ---------------------------------------------------------------------------
-# 特別休業日・臨時営業日設定のローカル永続化(月度ごと)
-# ---------------------------------------------------------------------------
-#
-# kyuka_requests(希望休・有休)は多数のスタッフが同時に個別申請しうるため
-# 追記型ログで安全に扱っているが、特別休業日・臨時営業日はTab1の管理者側の
-# カレンダー設定であり、shift結果(save_shift_result_to_disk)と同様に単純な
-# 上書き保存で十分(=同時編集の衝突リスクが低い)。月度ごとに独立したファイル
-# で管理し、他の月度のデータとは混ざらないようにする(kyuka_log_path_forと
-# 同じ設計)。
-
-
-def special_days_settings_path_for(year: int, month: int) -> str:
-    """月度別の特別休業日・臨時営業日設定の保存パスを返す。"""
-    return os.path.join(DATA_DIR, f"special_days_{int(year)}_{int(month):02d}.json")
-
-
-def save_special_days_settings(
-    year: int,
-    month: int,
-    special_closure_map: dict[dt.date, str],
-    forced_open_map: dict[dt.date, str],
-) -> None:
-    """指定月度の特別休業日・臨時営業日設定(日付→理由の辞書)をローカルへ即時保存する。
-
-    Tab1でのウィジェット操作のたびに呼び出すことで、最適化の実行や別タブへの
-    移動を挟んでも、また別ブラウザ・別端末からのアクセス時や再起動後でも、
-    月度を切り替えて戻ってくれば設定が保持される。
-    """
-    path = special_days_settings_path_for(year, month)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    payload = {
-        "special_closure": {d.isoformat(): r for d, r in special_closure_map.items()},
-        "forced_open": {d.isoformat(): r for d, r in forced_open_map.items()},
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-
-
-def load_special_days_settings(year: int, month: int) -> tuple[dict[dt.date, str], dict[dt.date, str]]:
-    """指定月度の特別休業日・臨時営業日設定を読み込む。
-
-    保存ファイルが無い/壊れている場合は (空辞書, 空辞書) を返す(クラッシュしない)。
-    """
-    path = special_days_settings_path_for(year, month)
-    if not os.path.exists(path):
-        return {}, {}
+def clear_saved_shift_result(*args, **kwargs) -> None:
+    """Googleスプレッドシートに保存済みの最新シフト結果を削除する。"""
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
+        sheets_store.clear_shift_result()
     except Exception:
-        return {}, {}
-
-    def _parse(section: str) -> dict[dt.date, str]:
-        result: dict[dt.date, str] = {}
-        for date_str, reason in (payload.get(section) or {}).items():
-            try:
-                d = dt.date.fromisoformat(date_str)
-            except (TypeError, ValueError):
-                continue
-            result[d] = reason
-        return result
-
-    return _parse("special_closure"), _parse("forced_open")
+        pass
 
 
 def build_simple_staff_summary(

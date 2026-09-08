@@ -21,7 +21,12 @@ st.set_page_config(page_title="眼鏡店シフト最適化", layout="wide")
 # ---------------------------------------------------------------------------
 def init_state():
     if "staff_df" not in st.session_state:
-        st.session_state.staff_df = utils.default_staff_df()
+        # Googleスプレッドシートに保存済みのスタッフ名簿があればそれを使い、
+        # 未設定・接続エラーの場合はデフォルトの名簿を使う。
+        loaded_staff_df = utils.load_staff_roster()
+        st.session_state.staff_df = (
+            loaded_staff_df if loaded_staff_df is not None and not loaded_staff_df.empty else utils.default_staff_df()
+        )
     if "requests_df" not in st.session_state:
         # 実際の読み込みは対象月度が確定した後(サイドバー処理内)に月度別ファイルから
         # 行う。ここでは空の雛形とし、requests_df_period を None にしておくことで
@@ -60,6 +65,10 @@ def init_state():
         st.session_state.forced_open_labels = []
     if "forced_open_reasons" not in st.session_state:
         st.session_state.forced_open_reasons = {}
+    if "special_days_period" not in st.session_state:
+        # 特別休業日・臨時営業日の設定を、最後にどの月度分をセッションへ
+        # 読み込んだか(=ディスクとの同期状態)を追跡する。None は未読み込み。
+        st.session_state.special_days_period = None
 
 
 init_state()
@@ -119,7 +128,7 @@ st.session_state.period = (year, month)
 period_dates = utils.get_period_dates(year, month)
 period_label = f"{year}年{month}月度 ({period_dates[0].month}/{period_dates[0].day}〜{period_dates[-1].month}/{period_dates[-1].day})"
 
-# 特別休業日(お盆・年末年始等)の選択は Tab1 のウィジェットで行うが、
+# 特別休業日(お盆・年末年始等)・臨時営業日の選択は Tab1 のウィジェットで行うが、
 # dates_df の計算(このすぐ下)より前に値を読む必要があるため、ここでは
 # 前回までにセッションへ保存された選択値を読み出すだけにする(Streamlitの
 # ウィジェットは key を通じて session_state と自動同期されるため、この
@@ -128,63 +137,49 @@ special_closure_labels_all = [
     f"{d.month}/{d.day}({wd})" for d, wd in zip(period_dates, [utils.WEEKDAY_JP[d.weekday()] for d in period_dates])
 ]
 special_closure_label_to_date = dict(zip(special_closure_labels_all, period_dates))
-date_to_special_closure_label = {v: k for k, v in special_closure_label_to_date.items()}
+date_to_special_closure_label = {d: l for l, d in special_closure_label_to_date.items()}
 
-# 特別休業日・臨時営業日の設定は月度ごとに独立したファイルへ保存し、月度を
-# 切り替えても(別ブラウザ・別端末からのアクセスや再起動後でも)保持されるように
-# する(kyuka_requestsログと同じ設計思想)。対象月度が実際に変わった時だけ
-# ディスクから読み直す(=ウィジェットの通常操作のたびに毎回読み直すと、まだ
-# ディスクへ保存されていない直前の操作がウィジェットに反映される前に上書き
-# されてしまう不安定なループになるため)。
-if st.session_state.get("special_days_period") != (year, month):
-    _loaded_special_map, _loaded_forced_map = utils.load_special_days_settings(year, month)
+# 対象月を切り替えた場合は、セッション上に残っている(別の月度の)選択値を
+# そのまま使わず、この月度分の保存済み設定をディスクから読み込み直す。
+# これにより、月をまたいで先行入力した特別休業日・臨時営業日の設定が、
+# プルダウンを元の月に戻しても失われないようにしている
+# (kyuka_requests_*.csvと同様、月度ごとに専用のファイルへ保存する方式)。
+if st.session_state.special_days_period != (year, month):
+    _loaded_special_closure_map, _loaded_forced_open_map = utils.load_special_days(year, month)
     st.session_state.special_closure_labels = [
-        date_to_special_closure_label[d] for d in _loaded_special_map if d in date_to_special_closure_label
+        date_to_special_closure_label[d] for d in _loaded_special_closure_map if d in date_to_special_closure_label
     ]
     st.session_state.special_closure_reasons = {
         date_to_special_closure_label[d]: r
-        for d, r in _loaded_special_map.items()
+        for d, r in _loaded_special_closure_map.items()
         if d in date_to_special_closure_label
     }
     st.session_state.forced_open_labels = [
-        date_to_special_closure_label[d] for d in _loaded_forced_map if d in date_to_special_closure_label
+        date_to_special_closure_label[d] for d in _loaded_forced_open_map if d in date_to_special_closure_label
     ]
     st.session_state.forced_open_reasons = {
         date_to_special_closure_label[d]: r
-        for d, r in _loaded_forced_map.items()
+        for d, r in _loaded_forced_open_map.items()
         if d in date_to_special_closure_label
     }
     st.session_state.special_days_period = (year, month)
 
-st.session_state.special_closure_labels = [
-    l for l in st.session_state.special_closure_labels if l in special_closure_label_to_date
-]
-# 理由(年末年始/計画年休/希望休 等)も同様に、選択されている日付ラベルの分だけを
-# 保持する(選択解除された日の理由設定は破棄する)。未設定の日はデフォルト理由。
-st.session_state.special_closure_reasons = {
-    l: r
-    for l, r in st.session_state.special_closure_reasons.items()
-    if l in st.session_state.special_closure_labels
-}
 special_closure_map: dict = {
     special_closure_label_to_date[l]: st.session_state.special_closure_reasons.get(
         l, utils.DEFAULT_SPECIAL_CLOSURE_LABEL
     )
     for l in st.session_state.special_closure_labels
-}
-
-# 臨時営業日(本来は定休日だが今回だけ営業する日)も同じパターンで、Tab1の
-# ウィジェットより前にsession_stateから読み出す。
-st.session_state.forced_open_labels = [
-    l for l in st.session_state.forced_open_labels if l in special_closure_label_to_date
-]
-st.session_state.forced_open_reasons = {
-    l: r for l, r in st.session_state.forced_open_reasons.items() if l in st.session_state.forced_open_labels
+    if l in special_closure_label_to_date
 }
 forced_open_map: dict = {
     special_closure_label_to_date[l]: st.session_state.forced_open_reasons.get(l, utils.DEFAULT_FORCED_OPEN_LABEL)
     for l in st.session_state.forced_open_labels
+    if l in special_closure_label_to_date
 }
+
+# Tab1のウィジェット操作(選択の追加・削除、理由の変更)を、保存ボタン不要で
+# その場でディスクへ反映する(自動保存。kyuka_requestsの管理者編集と同じ方針)。
+utils.save_special_days(year, month, special_closure_map, forced_open_map)
 
 dates_df = utils.classify_days(
     period_dates, special_closure_dates=special_closure_map, forced_open_dates=forced_open_map
@@ -378,24 +373,6 @@ with tab1:
                     ) or utils.DEFAULT_FORCED_OPEN_LABEL
                 st.session_state.forced_open_reasons[label] = choice
 
-    # 現在の特別休業日・臨時営業日設定を、この月度専用のファイルへ即時保存する。
-    # ここまでのウィジェット(multiselect・理由selectbox)の処理を経た「今回の
-    # 再実行での最新値」を使って保存する(=サイドバー側で先に計算していた
-    # special_closure_map/forced_open_mapは、このTab1の処理より前に確定した
-    # 値のため、直前の理由変更等がまだ反映されておらず1手遅れてしまう。
-    # そのため、保存はこの位置で改めて最新のsession_stateから組み直す)。
-    _save_special_closure_map = {
-        special_closure_label_to_date[l]: st.session_state.special_closure_reasons.get(
-            l, utils.DEFAULT_SPECIAL_CLOSURE_LABEL
-        )
-        for l in st.session_state.special_closure_labels
-    }
-    _save_forced_open_map = {
-        special_closure_label_to_date[l]: st.session_state.forced_open_reasons.get(l, utils.DEFAULT_FORCED_OPEN_LABEL)
-        for l in st.session_state.forced_open_labels
-    }
-    utils.save_special_days_settings(year, month, _save_special_closure_map, _save_forced_open_map)
-
     st.markdown("---")
     st.subheader(f"営業日一覧 — {period_label}")
     show_df = dates_df.copy()
@@ -483,7 +460,7 @@ with tab1:
             st.write("")
             st.write("")
             if st.button("追加"):
-                utils.append_kyuka_request(target_name, target_date, "有給申請", utils.kyuka_log_path_for(year, month))
+                utils.append_kyuka_request(target_name, target_date, "有給申請")
                 st.success(f"{target_name} / {target_date.month}/{target_date.day} を有給申請として追加しました。")
                 st.rerun()
     else:
@@ -493,12 +470,12 @@ with tab1:
 # --- Tab2: スタッフ・希望休設定 ---------------------------------------------
 # 業務フロー順(1.個別申請 → 2.管理者マトリクス確認 → 3.CSV一括入出力 →
 # 4.スタッフマスター)に上から並べる。各セクションは st.session_state / 画面
-# 冒頭で確定済みの dates_df・year・month・period_dates・period_label・
-# kyuka_log_path のみを参照する自己完結構成のため、順序を入れ替えても
+# 冒頭で確定済みの dates_df・year・month・period_dates・period_label
+# のみを参照する自己完結構成のため、順序を入れ替えても
 # 未定義変数の参照(NameError等)は発生しない。
+# 希望休・有休ログはGoogleスプレッドシート上の全期間共通の1シートに保存される
+# ため、月度別のログパスという概念はもはや存在しない。
 with tab2:
-    kyuka_log_path = utils.kyuka_log_path_for(year, month)
-
     # =========================================================================
     # 1. 希望休・有休 個別申請フォーム(最上部)
     # =========================================================================
@@ -526,7 +503,7 @@ with tab2:
         st.write("")
         st.write("")
         if st.button("💾 申請を保存", key="kyuka_form_submit", width="stretch"):
-            utils.append_kyuka_request(form_name, form_date, form_kind, kyuka_log_path)
+            utils.append_kyuka_request(form_name, form_date, form_kind)
             st.success(f"{form_name} / {form_date.month}/{form_date.day} を「{form_kind}」として保存しました。")
             st.rerun()
 
@@ -545,7 +522,7 @@ with tab2:
             lc2.write(r["kind"])
             cancel_key = f"kyuka_cancel_{r['staff_id']}_{r['date'].isoformat()}"
             if lc3.button("取消", key=cancel_key):
-                utils.append_kyuka_request(r["name"], r["date"], utils.CANCELLED_REQUEST_TYPE, kyuka_log_path)
+                utils.append_kyuka_request(r["name"], r["date"], utils.CANCELLED_REQUEST_TYPE)
                 st.rerun()
 
     st.divider()
@@ -557,10 +534,9 @@ with tab2:
     st.caption(
         "種別: 希望休(ソフト・希望として考慮) / 絶対休・有給申請(いずれもハード=100%遵守、"
         "出勤枠を完全に禁止)"
-        f"　※ 個別申請フォーム・CSV取込の内容は、月度ごとに独立した追記型ログ"
-        f"(data/kyuka_requests_{year}_{month:02d}.csv)へ即時保存され、再起動や別ブラウザ"
-        "でのアクセス時にも復元されます。2〜3ヶ月先の月度に切り替えて先行入力しても、"
-        "他の月度のデータとは混ざりません。"
+        "　※ 個別申請フォーム・CSV取込の内容は、Googleスプレッドシート上の追記型ログへ"
+        "即時保存され、再起動や別ブラウザでのアクセス時にも復元されます。2〜3ヶ月先の"
+        "月度に切り替えて先行入力しても、他の月度のデータとは混ざりません。"
     )
     st.caption(
         "この表は個別申請フォームからの入力を自動集計したものです。"
@@ -612,7 +588,7 @@ with tab2:
             # した個別申請が「管理者が消した差分」と誤認識され、巻き込んで
             # 消えてしまうため、あえて読み直さない。実際に値が変化したセルの
             # 分だけが差分追記される。
-            utils.sync_admin_requests_edit(current_requests_df, edited_long_current, kyuka_log_path)
+            utils.sync_admin_requests_edit(current_requests_df, edited_long_current)
             st.toast("マトリクス表の変更を自動保存しました。", icon="💾")
             st.rerun()
         else:
@@ -620,7 +596,7 @@ with tab2:
 
         st.markdown("---")
         if st.button("🗑️ 休暇データをリセット（この月度のみ・管理者操作）", key="reset_requests_button"):
-            utils.clear_kyuka_log(kyuka_log_path)
+            utils.clear_kyuka_log(current_requests_df)
             st.success(f"{period_label}の希望休・有休データをリセットしました。")
             st.rerun()
 
@@ -685,7 +661,7 @@ with tab2:
                         keep_mask = ~existing.apply(lambda r: (r["name"], r["date"]) in new_keys, axis=1)
                         existing = existing[keep_mask]
                     target_df = pd.concat([existing, new_rows_df], ignore_index=True)
-                utils.sync_admin_requests_edit(fresh_current, target_df, kyuka_log_path)
+                utils.sync_admin_requests_edit(fresh_current, target_df)
                 st.success(f"{len(new_rows_df)} 件の希望休・有休データを取り込みました。")
                 st.rerun()
 
@@ -795,6 +771,14 @@ with tab2:
     merged["preferred_off_date"] = edited["個別公休希望日"].map(lambda lbl: label_to_date.get(lbl))
     st.session_state.staff_df = recompute_allowed_stores(merged)
     st.caption("↑ このテーブルの編集内容は選択のたびに自動反映されます（別途保存ボタンは不要です）。")
+
+    # 変更があった場合のみGoogleスプレッドシートへ保存する(毎回の再実行での
+    # 無駄な書き込みを避けるため、直前に保存した内容とのスナップショット比較で判定)。
+    _staff_df_for_save = st.session_state.staff_df
+    _prev_saved_staff_df = st.session_state.get("_staff_roster_last_saved")
+    if _prev_saved_staff_df is None or not _prev_saved_staff_df.equals(_staff_df_for_save):
+        utils.save_staff_roster(_staff_df_for_save)
+        st.session_state._staff_roster_last_saved = _staff_df_for_save.copy()
 
 
 # --- Tab3: シフト結果・警告 ---------------------------------------------------
