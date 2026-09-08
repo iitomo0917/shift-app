@@ -178,8 +178,16 @@ forced_open_map: dict = {
 }
 
 # Tab1のウィジェット操作(選択の追加・削除、理由の変更)を、保存ボタン不要で
-# その場でディスクへ反映する(自動保存。kyuka_requestsの管理者編集と同じ方針)。
-utils.save_special_days(year, month, special_closure_map, forced_open_map)
+# その場でGoogleスプレッドシートへ反映する(自動保存。kyuka_requestsの管理者編集と
+# 同じ方針)。ただし、このブロックは対象月度が変わっていない限りスクリプトの
+# 再実行のたびに(=他のフォーム操作やボタン押下のたびに)毎回通過するため、
+# 実際に値が変化した場合のみ保存するようガードする(無条件に保存すると、
+# Googleスプレッドシートへの書き込みAPIが短時間に大量に呼ばれ、利用制限
+# エラー(APIError)を引き起こしてしまうため)。
+_special_days_snapshot = (year, month, special_closure_map, forced_open_map)
+if st.session_state.get("_special_days_last_saved") != _special_days_snapshot:
+    utils.save_special_days(year, month, special_closure_map, forced_open_map)
+    st.session_state._special_days_last_saved = _special_days_snapshot
 
 dates_df = utils.classify_days(
     period_dates, special_closure_dates=special_closure_map, forced_open_dates=forced_open_map
