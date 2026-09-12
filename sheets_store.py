@@ -1,4 +1,4 @@
-"""
+﻿"""
 Googleスプレッドシートを永続化バックエンドとするデータ保存層。
 
 背景:
@@ -157,9 +157,20 @@ def _get_or_create_worksheet(title: str, columns: list[str]):
     try:
         ws = sheet.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=title, rows=2000, cols=max(10, len(columns)))
-        ws.append_row(columns)
-        return ws
+        try:
+            ws = sheet.add_worksheet(title=title, rows=2000, cols=max(10, len(columns)))
+            ws.append_row(columns)
+            return ws
+        except Exception:
+            # 複数のブラウザ/端末からほぼ同時にアクセスした場合、双方が「まだ
+            # シートが無い」と判断して同時に作成しようとすることがある。この
+            # 場合Google側が名前の重複を避けて "xxx_conflictNNN" のような別名の
+            # シートを作ってしまうことがあるため、まず既存のシートが実は
+            # (直前の競合相手により)既に作られていないか再確認してから諦める。
+            try:
+                return sheet.worksheet(title)
+            except gspread.WorksheetNotFound:
+                raise
     values = ws.get_all_values()
     if not values:
         ws.append_row(columns)
@@ -190,9 +201,22 @@ def append_kyuka_request(staff_name: str, date: dt.date, request_type: str) -> N
         ],
         value_input_option="RAW",
     )
+    # 書き込み直後は必ず最新内容を読み直せるよう、読み込みキャッシュを破棄する。
+    load_kyuka_log.clear()
 
 
+@st.cache_data(ttl=8, show_spinner=False)
 def load_kyuka_log() -> pd.DataFrame:
+    """ログの全行を読み込む。結果は数秒間キャッシュする。
+
+    画面操作(ボタン押下・ウィジェット変更)のたびにStreamlitのスクリプトが
+    再実行され、その都度この関数が呼ばれるため、キャッシュ無しだと短時間に
+    大量のGoogle Sheets API呼び出しが発生し、レート制限エラー
+    (gspread.exceptions.APIError)の原因になっていた。ttl秒以内の再読み込みは
+    キャッシュされた結果を返すことでAPI呼び出し回数を抑える。書き込み直後は
+    append_kyuka_request/clear_kyuka_requests_in_range側でキャッシュを明示的に
+    破棄しているため、保存した内容が反映されないことはない。
+    """
     ws = _get_or_create_worksheet(KYUKA_SHEET, KYUKA_COLUMNS)
     return _records_to_df(ws, KYUKA_COLUMNS)
 
@@ -211,7 +235,12 @@ def clear_kyuka_requests_in_range(active_requests: list[tuple[str, dt.date]]) ->
 # 特別休業日・臨時営業日の設定(全期間共通の1シート、(year, month, date, category)で一意)
 # ---------------------------------------------------------------------------
 
+@st.cache_data(ttl=8, show_spinner=False)
 def load_special_days_all() -> pd.DataFrame:
+    """全期間分の特別休業日・臨時営業日設定を読み込む。結果は数秒間キャッシュする
+    (理由はload_kyuka_logのコメントを参照。app.py側でこの関数が画面操作のたびに
+    毎回呼ばれるため、キャッシュしないとAPIレート制限に達しやすい)。
+    """
     ws = _get_or_create_worksheet(SPECIAL_DAYS_SHEET, SPECIAL_DAYS_COLUMNS)
     return _records_to_df(ws, SPECIAL_DAYS_COLUMNS)
 
@@ -224,6 +253,7 @@ def save_special_days(
 ) -> None:
     """指定月度分の特別休業日・臨時営業日の設定を書き換える(その月度分のみ全体置換)。"""
     ws = _get_or_create_worksheet(SPECIAL_DAYS_SHEET, SPECIAL_DAYS_COLUMNS)
+    # ここは保存(マージ)のための読み込みなので、キャッシュを経由せず常に最新を取得する。
     df = _records_to_df(ws, SPECIAL_DAYS_COLUMNS)
     if not df.empty:
         keep = df[~((df["year"] == str(year)) & (df["month"] == str(month)))]
@@ -241,6 +271,7 @@ def save_special_days(
     ws.append_row(SPECIAL_DAYS_COLUMNS)
     if out_rows:
         ws.append_rows(out_rows, value_input_option="RAW")
+    load_special_days_all.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +315,12 @@ def _decode_staff_row(row: dict) -> dict:
     return out
 
 
+@st.cache_data(ttl=8, show_spinner=False)
 def load_staff_roster() -> pd.DataFrame | None:
-    """保存済みのスタッフ名簿を読み込む。1件も無い場合はNoneを返す(=呼び出し側でデフォルト値を使う)。"""
+    """保存済みのスタッフ名簿を読み込む。1件も無い場合はNoneを返す(=呼び出し側でデフォルト値を使う)。
+
+    結果は数秒間キャッシュする(理由はload_kyuka_logのコメントを参照)。
+    """
     ws = _get_or_create_worksheet(STAFF_SHEET, STAFF_COLUMNS)
     df = _records_to_df(ws, STAFF_COLUMNS)
     if df.empty:
@@ -302,6 +337,7 @@ def save_staff_roster(staff_df: pd.DataFrame) -> None:
     ws.append_row(STAFF_COLUMNS)
     if rows:
         ws.append_rows(rows, value_input_option="RAW")
+    load_staff_roster.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -325,9 +361,12 @@ def save_shift_result(shift_df: pd.DataFrame, meta: dict) -> None:
     meta_rows = [[k, json.dumps(v, ensure_ascii=False)] for k, v in meta.items()]
     if meta_rows:
         meta_ws.append_rows(meta_rows, value_input_option="RAW")
+    load_shift_result.clear()
 
 
+@st.cache_data(ttl=8, show_spinner=False)
 def load_shift_result() -> tuple[pd.DataFrame | None, dict]:
+    """結果は数秒間キャッシュする(理由はload_kyuka_logのコメントを参照)。"""
     try:
         ws = _get_or_create_worksheet(SHIFT_RESULT_SHEET, SHIFT_RESULT_COLUMNS)
         df = _records_to_df(ws, SHIFT_RESULT_COLUMNS)
@@ -359,3 +398,5 @@ def clear_shift_result() -> None:
     meta_ws = _get_or_create_worksheet(SHIFT_META_SHEET, SHIFT_META_COLUMNS)
     meta_ws.clear()
     meta_ws.append_row(SHIFT_META_COLUMNS)
+    load_shift_result.clear()
+
