@@ -420,8 +420,26 @@ def solve_shift(
                 model.Add(c_expr + sf_c >= 1).OnlyEnforceIf(combo)
                 penalty_terms += [(sf_e2, W_SHORTAGE), (sf_e1, W_SHORTAGE), (sf_b, W_SHORTAGE), (sf_c, W_SHORTAGE)]
                 if d not in weekend_holiday_days:
-                    # 高負荷店舗: 平日でも極力「社員2名体制」を優先(パート併用は軽く抑制)。
-                    penalty_terms.append((combo, W_STORE_PATTERN_PREF))
+                    # 月末の火曜日(=徳重店の火曜営業日。当店は最終火曜以外の火曜は
+                    # 定休日のため、営業日となる火曜は暦月内で必ずこの1日のみ)は、
+                    # パートB・パートCの双方に希望休/絶対休/有給申請が一切出ていない
+                    # 場合に限り、通常の平日とは逆に「社員1名+パートB+パートC」の
+                    # 3名体制を積極的に推奨する(負の重み)。どちらか一方でも休み希望が
+                    # 出ている日は、3名体制を組めない/組みにくいため、通常の平日と同様に
+                    # 「社員2名体制」を優先する(正の重み)。
+                    is_month_end_tuesday = (
+                        d.weekday() == 1 and d == utils.last_tuesday_of_month(d.year, d.month)
+                    )
+                    partner_ids = set(b_here) | set(c_here)
+                    partner_has_leave_request = any(
+                        d in hard_off_dates.get(pid, set()) or d in soft_off_dates.get(pid, {})
+                        for pid in partner_ids
+                    )
+                    if is_month_end_tuesday and not partner_has_leave_request:
+                        penalty_terms.append((combo, -W_STORE_PATTERN_PREF))
+                    else:
+                        # 高負荷店舗: 平日でも極力「社員2名体制」を優先(パート併用は軽く抑制)。
+                        penalty_terms.append((combo, W_STORE_PATTERN_PREF))
                 shortage_records[(d, store)] = {
                     "type": "tokushige",
                     "vars": {
