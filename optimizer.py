@@ -55,6 +55,14 @@ W_PART_BONUS = 5        # パート(尾澤/野道/柴田)が1日出勤するご�
 W_STORE_PATTERN_PREF = 5  # 店舗の平日体制パターンに関するソフトな優先度。
                           # 正の値=社員2名体制を優先(パート併用を軽く抑制)、
                           # 負の値=社員1名+パート体制を優先(パート併用を軽く推奨)。
+W_TOKUSHIGE_LEAVE_SLOT_BONUS = 5  # 徳重店: 月末火曜日以外の通常の平日についても、
+                          # 「社員1名+パート不動野+パート前田」の3名体制を組むことを
+                          # 推奨する(負の重み=報酬)ための係数。社員の有給取得可能日
+                          # (店舗の余剰人員)を作り出すのが目的。ただし常態化を避ける
+                          # ため、期間内でこの体制を使えるのは最大3日までという
+                          # ハード上限(tokushige_weekday_extra_combo_varsの合計<=3)と
+                          # 組み合わせて使用する。曜日は固定せず、他の制約(希望休・
+                          # 人員不足解消等)を満たしやすい日をソルバーが自由に選ぶ。
 W_INAZAWA_PRIORITY = 50  # 稲沢店の優先順位(山岡>若松>真田>竹内)を破った場合。
                          # 通常時は確実にこの順位を守らせたいが、他店舗の人員不足
                          # (W_SHORTAGE=1000等)を解消するために優先者を動かす必要が
@@ -310,6 +318,10 @@ def solve_shift(
                 model.Add(cp_model.LinearExpr.Sum(expr_terms) <= 6)
 
     # --- 6. 店舗別 必要人員体制(不足はスラックで許容) ------------------------
+    # 徳重店: 月末火曜日以外の通常の平日で「社員1名+パート不動野+パート前田」の
+    # 3名体制を推奨した回数を集計するための変数リスト(下の6bで期間内合計を
+    # 最大3日までに制限するハード制約に使用する)。
+    tokushige_weekday_extra_combo_vars: list = []
     for d in business_days:
         for store in utils.STORES:
             employees_here = [
@@ -435,6 +447,21 @@ def solve_shift(
                         d in hard_off_dates.get(pid, set()) or d in soft_off_dates.get(pid, {})
                         for pid in partner_ids
                     )
+                    if is_month_end_tuesday and not partner_has_leave_request:
+                        penalty_terms.append((combo, -W_STORE_PATTERN_PREF))
+                    elif is_month_end_tuesday:
+                        # 月末火曜日だが、パートB・パートCのどちらかに休み希望が
+                        # 出ているため、通常の平日と同様に社員2名体制を優先する。
+                        penalty_terms.append((combo, W_STORE_PATTERN_PREF))
+                    else:
+                        # 月末火曜日以外の通常の平日: 基本的には高負荷店舗のため
+                        # 「社員2名体制」を優先しつつも、正社員の有給取得可能日を
+                        # 期間内で確保するため、この3名体制(社員1名+パート不動野+
+                        # パート前田)を組むことも軽く推奨する(負の重み=報酬)。
+                        # ただし常態化させないよう、実際に選べる日数は6bのハード
+                        # 制約により期間内で最大3日までに制限される。
+                        penalty_terms.append((combo, -W_TOKUSHIGE_LEAVE_SLOT_BONUS))
+                        tokushige_weekday_extra_combo_vars.append(combo)
                 shortage_records[(d, store)] = {
                     "type": "tokushige",
                     "vars": {
@@ -459,6 +486,16 @@ def solve_shift(
             model.Add(skill_expr + skill_shortfall >= staffed_bool)
             penalty_terms.append((skill_shortfall, W_SKILL))
             shortage_records[(d, store)].setdefault("vars", {})["スキル保有者不在"] = skill_shortfall
+
+    # --- 6b. 徳重店: 有給取得可能日創出のための平日3名体制の上限(ハード) ---------
+    #     上記6で、月末火曜日以外の通常の平日についても「社員1名+パート不動野+
+    #     パート前田」の3名体制をソフトに推奨しているが、これが常態化して
+    #     「社員2名体制」の本来の優先度を崩してしまわないよう、期間内で実際に
+    #     この体制を選べる日数を最大3日までに制限する(恒久的なシフトルール)。
+    #     希望休や人員不足解消等、他の制約と衝突する場合は0日や1〜2日に
+    #     とどまることもあり、必ず3日使われるとは限らない(あくまでソフトな推奨)。
+    if tokushige_weekday_extra_combo_vars:
+        model.Add(cp_model.LinearExpr.Sum(tokushige_weekday_extra_combo_vars) <= 3)
 
     # --- 7. 希望休(ソフト) ---------------------------------------------------
     #     現行の区分では希望休のみがソフト制約(SOFT_OFF_KINDS={"希望休"})。
