@@ -1750,10 +1750,7 @@ def build_export_workbook(
     from openpyxl.utils import get_column_letter
 
     dates = list(dates_df["date"])
-    date_labels = [
-        f"{d.month}/{d.day}({row.weekday_jp})" + ("\n休業" if getattr(row, "is_special_closure", False) else "")
-        for d, row in zip(dates, dates_df.itertuples())
-    ]
+    weekday_jp_by_date = dict(zip(dates_df["date"], dates_df["weekday_jp"]))
     n_date_cols = len(dates)
     total_cols = 1 + n_date_cols  # 列A=店舗名/見出し、以降は日付列
 
@@ -1804,18 +1801,71 @@ def build_export_workbook(
             b = c.border
             c.border = Border(left=b.left, right=b.right, top=b.top, bottom=style)
 
-    # --- ヘッダー行 ---------------------------------------------------------
-    ws1.cell(row=1, column=1, value="店舗").font = header_font
-    ws1.cell(row=1, column=1).fill = header_fill
-    ws1.cell(row=1, column=1).alignment = center
-    ws1.cell(row=1, column=1).border = cell_border
-    for j, (label, d) in enumerate(zip(date_labels, dates), start=2):
-        fill_hex, font_hex = _date_header_style(d)
-        c = ws1.cell(row=1, column=j, value=label)
-        c.font = Font(color=font_hex, bold=True, size=HEADER_FONT_SIZE)
-        c.fill = PatternFill("solid", fgColor=fill_hex)
-        c.alignment = center
-        c.border = cell_border
+    # 連続する同一年月の日付をグループ化する(例: 9/16〜9/30を1グループ、
+    # 10/1〜10/15を1グループとして返す)。日付ヘッダーの1行目「月」を、
+    # 同じ月の列全体で結合して中央に1回だけ表示するために使用する。
+    def _group_dates_by_month(date_list: list[dt.date]) -> list[tuple[int, int, str]]:
+        groups: list[tuple[int, int, str]] = []
+        start = 0
+        for i in range(1, len(date_list) + 1):
+            if i == len(date_list) or (date_list[i].year, date_list[i].month) != (
+                date_list[start].year,
+                date_list[start].month,
+            ):
+                groups.append((start, i - 1, f"{date_list[start].month}月"))
+                start = i
+        return groups
+
+    # 日付ヘッダーを「1行目=月(結合)・2行目=日にち・3行目=曜日」の3行構成で
+    # 書き込む共通処理(店舗別日別シフト表・スタッフ別出勤一覧表の両シートで使用)。
+    # header_row: このヘッダーブロックの先頭行番号(常に1)。date_col_start: 日付列が
+    # 始まる列番号(シート1は2列目、シート2は3列目)。
+    def _write_date_header_rows(ws, header_row: int, date_col_start: int) -> None:
+        month_row, day_row, weekday_row = header_row, header_row + 1, header_row + 2
+        for start_idx, end_idx, label in _group_dates_by_month(dates):
+            col_start = date_col_start + start_idx
+            col_end = date_col_start + end_idx
+            if col_end > col_start:
+                ws.merge_cells(start_row=month_row, start_column=col_start, end_row=month_row, end_column=col_end)
+            for col in range(col_start, col_end + 1):
+                c = ws.cell(row=month_row, column=col, value=label if col == col_start else None)
+                c.font = header_font
+                c.fill = header_fill
+                c.alignment = center
+                c.border = cell_border
+        for j, d in enumerate(dates):
+            col = date_col_start + j
+            fill_hex, font_hex = _date_header_style(d)
+            day_font = Font(color=font_hex, bold=True, size=HEADER_FONT_SIZE)
+            day_cell = ws.cell(row=day_row, column=col, value=d.day)
+            day_cell.font = day_font
+            day_cell.fill = PatternFill("solid", fgColor=fill_hex)
+            day_cell.alignment = center
+            day_cell.border = cell_border
+
+            weekday_label = weekday_jp_by_date.get(d, "") + (
+                "\n休業" if special_closure_by_date.get(d) else ""
+            )
+            weekday_cell = ws.cell(row=weekday_row, column=col, value=weekday_label)
+            weekday_cell.font = day_font
+            weekday_cell.fill = PatternFill("solid", fgColor=fill_hex)
+            weekday_cell.alignment = center
+            weekday_cell.border = cell_border
+
+    # 見出し列(日付以外の列)を、ヘッダーの3行分を縦結合した1つのセルとして表示する
+    # 共通処理(「店舗」「スタッフ」「区分」「出勤日数」等の縦見出しに使用)。
+    def _write_merged_corner_header(ws, header_row: int, col: int, value: str) -> None:
+        ws.merge_cells(start_row=header_row, start_column=col, end_row=header_row + 2, end_column=col)
+        for r in range(header_row, header_row + 3):
+            c = ws.cell(row=r, column=col, value=value if r == header_row else None)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center
+            c.border = cell_border
+
+    # --- ヘッダー行(1〜3行目: 月・日にち・曜日) --------------------------------
+    _write_merged_corner_header(ws1, 1, 1, "店舗")
+    _write_date_header_rows(ws1, 1, 2)
 
     # --- スタッフ固有のパステル背景色 -----------------------------------------
     staff_colors = assign_staff_colors(staff_df)
@@ -1827,7 +1877,8 @@ def build_export_workbook(
         return PatternFill("solid", fgColor=color) if color else None
 
     # --- 店舗ごとの出勤者ブロック(1セル1名・縦分割) ----------------------------
-    current_row = 2
+    # ヘッダーが1〜3行目(月・日にち・曜日)の3行構成のため、データ行は4行目から開始する。
+    current_row = 4
     emp_type_by_staff = dict(zip(shift_df["staff_id"], shift_df["emp_type"])) if not shift_df.empty else {}
 
     # 「店舗別日別シフト表」シートは、実際の店舗別上限人数(STORE_MAX_HEADCOUNT、
@@ -1943,39 +1994,35 @@ def build_export_workbook(
     for j in range(34, total_cols + 1):
         ws1.column_dimensions[get_column_letter(j)].width = 13
 
-    # 1行目(ヘッダー)は 52px相当(39pt)、2行目〜店舗ブロック最終行(2行目+7店舗×
-    # 4枠-1=29行目)は 29px相当(21.75pt)に統一する(店舗ブロックの行数を固定値で
-    # 再計算せず、実際に描画したEXCEL_STORE_SLOT_ROWS×STORES数から動的に導出する)。
-    header_row_end = 1
-    store_rows_end = header_row_end + EXCEL_STORE_SLOT_ROWS * len(STORES)  # 2行目+28行=29行目
-    ws1.row_dimensions[1].height = 39.0
-    for r in range(2, store_rows_end + 1):
+    # ヘッダー(1〜3行目: 月・日にち・曜日)は1行あたり 20px相当(15pt)、
+    # 4行目〜店舗ブロック最終行(4行目+7店舗×4枠-1=31行目)は 29px相当(21.75pt)
+    # に統一する(店舗ブロックの行数を固定値で再計算せず、実際に描画した
+    # EXCEL_STORE_SLOT_ROWS×STORES数から動的に導出する)。
+    header_row_end = 3
+    store_rows_end = header_row_end + EXCEL_STORE_SLOT_ROWS * len(STORES)  # 4行目+28行=31行目
+    for r in range(1, header_row_end + 1):
+        ws1.row_dimensions[r].height = 15.0
+    for r in range(header_row_end + 1, store_rows_end + 1):
         ws1.row_dimensions[r].height = 21.75
 
-    ws1.freeze_panes = "B2"
+    ws1.freeze_panes = "B4"
     ws1.page_setup.orientation = "landscape"
     ws1.page_setup.paperSize = ws1.PAPERSIZE_A3
     ws1.page_setup.fitToWidth = 1
     ws1.page_setup.fitToHeight = 0
     ws1.sheet_properties.pageSetUpPr.fitToPage = True
-    ws1.print_title_rows = "1:1"
+    ws1.print_title_rows = "1:3"
 
     # --- シート2: スタッフ別出勤一覧表 -----------------------------------
     ws2 = wb.create_sheet("スタッフ別出勤一覧表")
-    header2 = ["スタッフ", "区分"] + date_labels + ["出勤日数"]
-    for j, label in enumerate(header2, start=1):
-        c = ws2.cell(row=1, column=j, value=label)
-        c.alignment = center
-        c.border = cell_border
-        if 3 <= j <= 2 + n_date_cols:
-            fill_hex, font_hex = _date_header_style(dates[j - 3])
-            c.font = Font(color=font_hex, bold=True, size=HEADER_FONT_SIZE)
-            c.fill = PatternFill("solid", fgColor=fill_hex)
-        else:
-            c.font = header_font
-            c.fill = header_fill
+    # ヘッダー行(1〜3行目: 月・日にち・曜日)。「スタッフ」「区分」「出勤日数」の
+    # 3列は、シート1の「店舗」列と同様に3行分を縦結合した見出しにする。
+    _write_merged_corner_header(ws2, 1, 1, "スタッフ")
+    _write_merged_corner_header(ws2, 1, 2, "区分")
+    _write_date_header_rows(ws2, 1, 3)
+    _write_merged_corner_header(ws2, 1, 2 + n_date_cols + 1, "出勤日数")
 
-    for i, s in enumerate(staff_df.itertuples(), start=2):
+    for i, s in enumerate(staff_df.itertuples(), start=4):
         sid = s.staff_id
         row_fill = PatternFill("solid", fgColor=staff_colors[sid]) if sid in staff_colors else None
         name_cell = ws2.cell(row=i, column=1, value=s.name)
@@ -2011,16 +2058,21 @@ def build_export_workbook(
         ws2.column_dimensions[get_column_letter(j)].width = 5.4
     ws2.column_dimensions[get_column_letter(3 + n_date_cols)].width = 10
 
-    # 1行目(ヘッダー)〜18行目の行高を 52px相当(39pt)に統一する。
-    for r in range(1, 19):
+    # ヘッダー(1〜3行目: 月・日にち・曜日)は1行あたり 20px相当(15pt)、
+    # 4行目〜20行目(データ行、旧仕様の2〜18行目に相当)の行高を
+    # 52px相当(39pt)に統一する。
+    for r in range(1, 4):
+        ws2.row_dimensions[r].height = 15.0
+    for r in range(4, 21):
         ws2.row_dimensions[r].height = 39.0
 
-    ws2.freeze_panes = "C2"
+    ws2.freeze_panes = "C4"
     ws2.page_setup.orientation = "landscape"
     ws2.page_setup.paperSize = ws2.PAPERSIZE_A3
     ws2.page_setup.fitToWidth = 1
     ws2.page_setup.fitToHeight = 0
     ws2.sheet_properties.pageSetUpPr.fitToPage = True
+    ws2.print_title_rows = "1:3"
 
     output = io.BytesIO()
     wb.save(output)
