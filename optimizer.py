@@ -435,11 +435,6 @@ def solve_shift(
                         d in hard_off_dates.get(pid, set()) or d in soft_off_dates.get(pid, {})
                         for pid in partner_ids
                     )
-                    if is_month_end_tuesday and not partner_has_leave_request:
-                        penalty_terms.append((combo, -W_STORE_PATTERN_PREF))
-                    else:
-                        # 高負荷店舗: 平日でも極力「社員2名体制」を優先(パート併用は軽く抑制)。
-                        penalty_terms.append((combo, W_STORE_PATTERN_PREF))
                 shortage_records[(d, store)] = {
                     "type": "tokushige",
                     "vars": {
