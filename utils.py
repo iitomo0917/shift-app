@@ -374,12 +374,13 @@ def default_staff_df() -> pd.DataFrame:
     df.loc[df["name"] == "尾澤", "preferred_store"] = "名古屋中川店"
 
     # 土曜・日曜(祝日は含まない)に限り特定の店舗への配置を禁止するスタッフ(ハード制約)。
-    #   若松: 土日は大治店を優先配置とするため、残る稲沢店を禁止(=土日は大治店固定)。
-    #        (新蟹江店は weekend_holiday_forbidden_stores で既に禁止済み)
+    #   若松: 以前は「土日は大治店固定」のため稲沢店をここで完全禁止していたが、
+    #        山岡・若松・竹内が同一の土日に出勤する際、稲沢店を山岡が優先配属される
+    #        結果として新蟹江店が「正社員+若松(検査技能なし)」の組合せになって
+    #        しまうケースを避けたいとの要望(2026/9時点)により、完全禁止をやめ、
+    #        optimizer.py 側のソフト制約(W_WAKAMATSU_WEEKEND_OTAJI、普段は大治店を
+    #        優先しつつ、必要な場合のみ稲沢店も許容する)に置き換えた。
     df["saturday_sunday_forbidden_stores"] = [[] for _ in range(len(df))]
-    df.loc[df["name"] == "若松", "saturday_sunday_forbidden_stores"] = df.loc[
-        df["name"] == "若松", "saturday_sunday_forbidden_stores"
-    ].apply(lambda _: ["稲沢店"])
 
     return df
 

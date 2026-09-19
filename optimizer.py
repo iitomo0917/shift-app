@@ -76,6 +76,17 @@ W_WEEKEND_HOLIDAY_AVOID = 50  # 土日祝に「原則避けたい店舗」(weeke
                          # 場合の最終手段として配属を許容したいため、W_INAZAWA_
                          # PRIORITYと同様に「真の人員不足系のペナルティよりは弱いが、
                          # 軽微なソフト優先度よりは明確に強い」値にしている。
+W_WAKAMATSU_WEEKEND_OTAJI = 20  # 若松: 純粋な土曜・日曜(祝日除く)に大治店以外へ配属した
+                        # 場合の軽いペナルティ。普段は大治店を優先させたいが、山岡・
+                        # 若松・竹内が同一の土日に出勤し、新蟹江店が「正社員+若松
+                        # (検査技能なし)」の組合せになってしまうくらいなら、稲沢店に
+                        # 若松を配属し新蟹江店には竹内(検査技能あり)を配属したいとの
+                        # 要望(2026/9時点)により、以前の完全禁止(ハード制約)をやめ、
+                        # この軽いソフト制約に置き換えた。W_WEEKEND_HOLIDAY_AVOID
+                        # (=50、若松の新蟹江店回避)や W_INAZAWA_PRIORITY(=50、
+                        # 稲沢店の山岡>若松優先順位)より明確に弱い値にすることで、
+                        # 「若松が新蟹江店に回るくらいなら稲沢店に回す方が良い」という
+                        # 判断をソルバーが選べるようにしている。
 
 BIG_M = 10
 
@@ -265,11 +276,26 @@ def solve_shift(
     #     せいで lo(若松・真田・竹内)全員が稲沢店に入れなくなり、不足が稲沢店側へ
     #     「移動」するだけでゼロにできない、という副作用が発覚したため、
     #     ソフト制約(重いペナルティ)に変更した。
+    #     例外: 山岡(hi)と若松(lo)のペアに限り、純粋な土曜・日曜(祝日除く)は
+    #     この優先順位ペナルティを課さない。山岡・若松・竹内が同一の土日に出勤し、
+    #     新蟹江店が「正社員+若松(検査技能なし)」の組合せになってしまうくらいなら、
+    #     稲沢店を若松に譲って山岡が他店舗へ回り、新蟹江店には竹内(検査技能あり)を
+    #     配属したいとの要望(2026/9時点)による。この例外がないと、若松が稲沢店に
+    #     入るたびに本ペナルティ(W_INAZAWA_PRIORITY=50)が課され、新蟹江店回避の
+    #     ペナルティ(W_WEEKEND_HOLIDAY_AVOID=50)と同水準になってしまい、ソルバーが
+    #     この配置転換を選べなくなる。平日・祝日や他のペア(山岡×真田・竹内、
+    #     若松×真田・竹内 等)にはこれまで通りこの優先順位を適用する。
+    yamaoka_id = name_to_id.get("山岡")
+    wakamatsu_id = name_to_id.get("若松")
+
     INAZAWA_PRIORITY_ORDER = ["山岡", "若松", "真田", "竹内"]
     inazawa_priority_ids = [name_to_id[n] for n in INAZAWA_PRIORITY_ORDER if n in name_to_id]
     for hi_pos, sid_hi in enumerate(inazawa_priority_ids):
         for sid_lo in inazawa_priority_ids[hi_pos + 1 :]:
+            exempt_pair = sid_hi == yamaoka_id and sid_lo == wakamatsu_id
             for d in business_days:
+                if exempt_pair and d in saturday_sunday_days:
+                    continue
                 lo_inazawa = work_vars.get((sid_lo, d, "稲沢店"))
                 if lo_inazawa is None:
                     continue
@@ -283,6 +309,20 @@ def solve_shift(
                 violation = model.NewBoolVar(f"inazawa_priority_violation_{sid_hi}_{sid_lo}_{d.isoformat()}")
                 model.Add(lo_inazawa + cp_model.LinearExpr.Sum(hi_other_terms) <= 1 + violation)
                 penalty_terms.append((violation, W_INAZAWA_PRIORITY))
+
+    # --- 4e-ii. 若松: 純粋な土曜・日曜(祝日除く)は大治店を優先(ソフト制約) ----------
+    #     以前はここをハード制約(稲沢店を完全禁止)としていたが、上記4eの例外と
+    #     組み合わせて「普段は大治店を優先しつつ、新蟹江店回避のために必要な場合は
+    #     稲沢店も許容する」というソフトな優先配置に変更した(2026/9時点の要望)。
+    if wakamatsu_id is not None:
+        otaji_other_terms = [
+            work_vars[(wakamatsu_id, d, st)]
+            for d in saturday_sunday_days
+            for st in effective_allowed.get(wakamatsu_id, [])
+            if st != "大治店" and (wakamatsu_id, d, st) in work_vars
+        ]
+        if otaji_other_terms:
+            penalty_terms.append((cp_model.LinearExpr.Sum(otaji_other_terms), W_WAKAMATSU_WEEKEND_OTAJI))
 
     # --- 4f. 土日祝の「原則避けたい店舗」への配属抑制(ソフト制約・重いペナルティ) ----
     #     weekend_holiday_forbidden_stores(4b、ハード制約=完全禁止)とは別に、
