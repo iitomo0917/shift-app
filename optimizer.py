@@ -87,6 +87,14 @@ W_WAKAMATSU_WEEKEND_OTAJI = 20  # 若松: 純粋な土曜・日曜(祝日除く)
                         # 稲沢店の山岡>若松優先順位)より明確に弱い値にすることで、
                         # 「若松が新蟹江店に回るくらいなら稲沢店に回す方が良い」という
                         # 判断をソルバーが選べるようにしている。
+W_YAMAOKA_TAKEUCHI_KANIE_SWAP = 20  # 山岡が新蟹江店に配属され、かつ竹内が同日に
+                        # 徳重店または極楽店に配属されている組み合わせへの軽い
+                        # ペナルティ。竹内を新蟹江店へ、山岡を徳重店・極楽店へ
+                        # 入れ替えたいとの要望(2026/9時点)による。他店舗の人員
+                        # 不足解消などでどうしても入れ替えられない場合は、
+                        # W_SHORTAGE等のより重いペナルティが優先されるよう、
+                        # W_INAZAWA_PRIORITY・W_WEEKEND_HOLIDAY_AVOID(=50)より
+                        # 明確に弱い値にしている。
 
 BIG_M = 10
 
@@ -344,6 +352,31 @@ def solve_shift(
         ]
         if avoid_terms:
             penalty_terms.append((cp_model.LinearExpr.Sum(avoid_terms), W_WEEKEND_HOLIDAY_AVOID))
+
+    # --- 4g. 山岡(新蟹江店)×竹内(徳重店・極楽店)の入れ替え推奨(ソフト制約) -------
+    #     山岡が新蟹江店に配属され、かつ同日に竹内が徳重店または極楽店に配属
+    #     されている場合、竹内を新蟹江店へ、山岡を竹内がいた徳重店・極楽店へ
+    #     入れ替えて配属することを推奨する(2026/9時点の要望)。曜日を問わず
+    #     全営業日(平日・土日・祝日)に適用する。他店舗の人員不足解消などで
+    #     どうしても入れ替えられない場合は、より重いペナルティ(W_SHORTAGE等)の
+    #     方が優先されるため、その場合は入れ替えなしを許容する。
+    yamaoka_id_kanie = name_to_id.get("山岡")
+    takeuchi_id_swap = name_to_id.get("竹内")
+    if yamaoka_id_kanie is not None and takeuchi_id_swap is not None:
+        for d in business_days:
+            yamaoka_kanie = work_vars.get((yamaoka_id_kanie, d, "新蟹江店"))
+            if yamaoka_kanie is None:
+                continue
+            takeuchi_other_terms = [
+                work_vars[(takeuchi_id_swap, d, st)]
+                for st in ("徳重店", "極楽店")
+                if (takeuchi_id_swap, d, st) in work_vars
+            ]
+            if not takeuchi_other_terms:
+                continue
+            violation = model.NewBoolVar(f"yamaoka_takeuchi_kanie_swap_violation_{d.isoformat()}")
+            model.Add(yamaoka_kanie + cp_model.LinearExpr.Sum(takeuchi_other_terms) <= 1 + violation)
+            penalty_terms.append((violation, W_YAMAOKA_TAKEUCHI_KANIE_SWAP))
 
     # --- 5. 最大6連勤(7日ウィンドウの合計<=6) --------------------------------
     for row in staff_df.itertuples():
