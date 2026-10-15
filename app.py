@@ -184,10 +184,26 @@ forced_open_map: dict = {
 # 実際に値が変化した場合のみ保存するようガードする(無条件に保存すると、
 # Googleスプレッドシートへの書き込みAPIが短時間に大量に呼ばれ、利用制限
 # エラー(APIError)を引き起こしてしまうため)。
+#
+# このブロックは(対象月度を変えない限り)アプリ操作のたびに必ず通過するため、
+# 以前は保存呼び出しを例外処理なしで直接行っていた。Googleスプレッドシート側の
+# 一時的なAPIエラー・レート制限・Secrets未設定などで保存が1回でも失敗すると、
+# 例外がそのまま画面全体のクラッシュとなり、かつ_special_days_last_savedが
+# 更新されないまま(=保存未完了のまま)フリーズするため、ページを再読み込みすると
+# 「設定した特別休業日・臨時営業日が消えてしまった(記憶されていない)」ように
+# 見える不具合があった。保存を try/except で囲み、失敗時は画面をクラッシュさせず
+# 警告表示のみにとどめ、_special_days_last_savedも更新しない(次回の再実行時に
+# 自動的に再試行される)よう修正した。
 _special_days_snapshot = (year, month, special_closure_map, forced_open_map)
 if st.session_state.get("_special_days_last_saved") != _special_days_snapshot:
-    utils.save_special_days(year, month, special_closure_map, forced_open_map)
-    st.session_state._special_days_last_saved = _special_days_snapshot
+    try:
+        utils.save_special_days(year, month, special_closure_map, forced_open_map)
+        st.session_state._special_days_last_saved = _special_days_snapshot
+    except Exception as e:
+        st.sidebar.warning(
+            "特別休業日・臨時営業日の設定をGoogleスプレッドシートへ保存できませんでした。"
+            f"画面を閉じると設定が失われる可能性があります。(詳細: {e})"
+        )
 
 dates_df = utils.classify_days(
     period_dates, special_closure_dates=special_closure_map, forced_open_dates=forced_open_map
