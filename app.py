@@ -249,8 +249,21 @@ if st.session_state.solve_result is None and st.session_state.get("_pending_shif
 # 別ブラウザ/別端末からの同時申請と衝突すると互いのデータを消してしまう恐れが
 # あったため廃止した。ここでは画面の再実行のたびに必ずログから最新状態を
 # 再構築するため、他のスタッフが直前に送信した申請も常に反映される。
-st.session_state.requests_df = utils.load_current_requests(year, month, st.session_state.staff_df)
-st.session_state.requests_df_period = (year, month)
+#
+# この呼び出しは(対象月度が変わっていなくても)画面操作のたびに必ず実行される
+# ため、Googleスプレッドシート側の一時的なAPIエラー・レート制限(例: 短時間に
+# 操作が集中した場合の「Quota exceeded」)が起きると、例外処理なしでは画面全体が
+# クラッシュしてしまっていた。try/exceptで囲み、失敗時は直前に読み込めていた
+# requests_dfをそのまま保持して画面を継続表示し、警告のみ表示するよう修正した
+# (特別休業日・臨時営業日の自動保存で行った修正と同じ方針)。
+try:
+    st.session_state.requests_df = utils.load_current_requests(year, month, st.session_state.staff_df)
+    st.session_state.requests_df_period = (year, month)
+except Exception as e:
+    st.sidebar.warning(
+        "希望休・有給データの最新状態をGoogleスプレッドシートから取得できませんでした。"
+        f"前回表示できていた内容のまま続行します。(詳細: {e})"
+    )
 
 closed_days_count_sidebar = int((~dates_df["is_business_day"]).sum())
 special_closure_count_sidebar = int(dates_df["is_special_closure"].sum())
