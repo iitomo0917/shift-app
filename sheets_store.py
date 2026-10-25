@@ -1,4 +1,4 @@
-﻿"""
+"""
 Googleスプレッドシートを永続化バックエンドとするデータ保存層。
 
 背景:
@@ -205,17 +205,24 @@ def append_kyuka_request(staff_name: str, date: dt.date, request_type: str) -> N
     load_kyuka_log.clear()
 
 
-@st.cache_data(ttl=8, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def load_kyuka_log() -> pd.DataFrame:
-    """ログの全行を読み込む。結果は数秒間キャッシュする。
+    """ログの全行を読み込む。結果はキャッシュする。
 
-    画面操作(ボタン押下・ウィジェット変更)のたびにStreamlitのスクリプトが
+    画面操作(ボタン押下・表の編集・タブ切り替え等)のたびにStreamlitのスクリプトが
     再実行され、その都度この関数が呼ばれるため、キャッシュ無しだと短時間に
     大量のGoogle Sheets API呼び出しが発生し、レート制限エラー
-    (gspread.exceptions.APIError)の原因になっていた。ttl秒以内の再読み込みは
-    キャッシュされた結果を返すことでAPI呼び出し回数を抑える。書き込み直後は
-    append_kyuka_request/clear_kyuka_requests_in_range側でキャッシュを明示的に
-    破棄しているため、保存した内容が反映されないことはない。
+    (gspread.exceptions.APIError、[429] Quota exceeded for quota metric
+    'Read requests')の原因になっていた。この接続は全利用者が同一のサービス
+    アカウントを共有するため、レート制限は「アプリを使っている全スタッフの
+    合計」に対してかかる。複数人が同時に使っている間に表(管理者用マトリクス表
+    など)を連続編集すると、以前のttl=8秒では呼び出しが積み重なって上限に達する
+    ことが実際に確認されたため、ttl=30秒に延長した(2026/10時点)。ttl秒以内の
+    再読み込みはキャッシュされた結果を返すことでAPI呼び出し回数を抑える。
+    書き込み直後はappend_kyuka_request/clear_kyuka_requests_in_range側で
+    キャッシュを明示的に破棄しているため、保存した内容が反映されないことはない。
+    延長の代償として、他のスタッフが入力した内容が画面に反映されるまで最大
+    ttl秒(30秒)ほど遅延する場合がある。
     """
     ws = _get_or_create_worksheet(KYUKA_SHEET, KYUKA_COLUMNS)
     return _records_to_df(ws, KYUKA_COLUMNS)
@@ -235,11 +242,11 @@ def clear_kyuka_requests_in_range(active_requests: list[tuple[str, dt.date]]) ->
 # 特別休業日・臨時営業日の設定(全期間共通の1シート、(year, month, date, category)で一意)
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=8, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def load_special_days_all() -> pd.DataFrame:
-    """全期間分の特別休業日・臨時営業日設定を読み込む。結果は数秒間キャッシュする
-    (理由はload_kyuka_logのコメントを参照。app.py側でこの関数が画面操作のたびに
-    毎回呼ばれるため、キャッシュしないとAPIレート制限に達しやすい)。
+    """全期間分の特別休業日・臨時営業日設定を読み込む。結果はキャッシュする
+    (理由・ttl値はload_kyuka_logのコメントを参照。app.py側でこの関数が画面操作の
+    たびに毎回呼ばれるため、キャッシュしないとAPIレート制限に達しやすい)。
     """
     ws = _get_or_create_worksheet(SPECIAL_DAYS_SHEET, SPECIAL_DAYS_COLUMNS)
     return _records_to_df(ws, SPECIAL_DAYS_COLUMNS)
@@ -315,11 +322,11 @@ def _decode_staff_row(row: dict) -> dict:
     return out
 
 
-@st.cache_data(ttl=8, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def load_staff_roster() -> pd.DataFrame | None:
     """保存済みのスタッフ名簿を読み込む。1件も無い場合はNoneを返す(=呼び出し側でデフォルト値を使う)。
 
-    結果は数秒間キャッシュする(理由はload_kyuka_logのコメントを参照)。
+    結果はキャッシュする(理由・ttl値はload_kyuka_logのコメントを参照)。
     """
     ws = _get_or_create_worksheet(STAFF_SHEET, STAFF_COLUMNS)
     df = _records_to_df(ws, STAFF_COLUMNS)
@@ -364,9 +371,9 @@ def save_shift_result(shift_df: pd.DataFrame, meta: dict) -> None:
     load_shift_result.clear()
 
 
-@st.cache_data(ttl=8, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def load_shift_result() -> tuple[pd.DataFrame | None, dict]:
-    """結果は数秒間キャッシュする(理由はload_kyuka_logのコメントを参照)。"""
+    """結果はキャッシュする(理由・ttl値はload_kyuka_logのコメントを参照)。"""
     try:
         ws = _get_or_create_worksheet(SHIFT_RESULT_SHEET, SHIFT_RESULT_COLUMNS)
         df = _records_to_df(ws, SHIFT_RESULT_COLUMNS)
