@@ -1032,17 +1032,24 @@ with tab3:
                 display_wide[label] = display_wide[label].replace("", utils.BLANK_LABEL)
 
             column_config_manual = {
-                "店舗": st.column_config.TextColumn("店舗", disabled=True),
-                "枠": st.column_config.NumberColumn("枠", disabled=True),
+                "店舗": st.column_config.TextColumn("店舗", disabled=True, pinned=True),
+                "枠": st.column_config.NumberColumn("枠", disabled=True, pinned=True),
             }
             for label in date_labels_manual:
                 column_config_manual[label] = st.column_config.SelectboxColumn(label, options=name_options_manual)
 
+            # 縦スクロールなしで全店舗(稲沢・大治・新蟹江・名古屋中川・徳重・極楽・
+            # 天白植田)の全枠を一度に表示できるよう、行数に応じた高さを明示的に
+            # 指定する(2026/11: 高さ未指定時はStreamlitの既定の小さい枠内で
+            # 縦スクロールになってしまっていたため修正)。「店舗」「枠」列は
+            # pinned=True により、左右スクロール時も常に左端に固定表示される。
+            manual_editor_height = 38 + 35 * len(display_wide)
             edited_wide = st.data_editor(
                 display_wide,
                 column_config=column_config_manual,
                 hide_index=True,
                 width="stretch",
+                height=manual_editor_height,
                 num_rows="fixed",
                 key="manual_shift_editor",
             )
