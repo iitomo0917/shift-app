@@ -1027,7 +1027,14 @@ with tab3:
             date_labels_manual = utils.manual_shift_date_labels(dates_df)
             name_options_manual = [utils.BLANK_LABEL] + st.session_state.staff_df["name"].tolist()
 
+            # 列の並び順は常に日付の昇順(12/16始まり)に強制する。st.data_editorの
+            # key固定ウィジェットは画面上で列をドラッグして並び替えた場合、その順序を
+            # 保持してしまうことがあるため、表示直前・保存直前の両方で必ず
+            # 「店舗」「枠」+ 日付昇順 の並びに矯正する(2026/11修正: 12/18始まりに
+            # なってしまう不具合の対策)。
+            canonical_columns_manual = ["店舗", "枠"] + date_labels_manual
             display_wide = st.session_state.manual_shift_wide.copy()
+            display_wide = display_wide[canonical_columns_manual]
             for label in date_labels_manual:
                 display_wide[label] = display_wide[label].replace("", utils.BLANK_LABEL)
 
@@ -1055,6 +1062,7 @@ with tab3:
             )
 
             stored_wide = edited_wide.copy()
+            stored_wide = stored_wide[canonical_columns_manual]
             for label in date_labels_manual:
                 stored_wide[label] = stored_wide[label].replace(utils.BLANK_LABEL, "")
             st.session_state.manual_shift_wide = stored_wide
