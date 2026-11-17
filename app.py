@@ -7,6 +7,8 @@ Streamlit + Google OR-Tools (CP-SAT)
 
 from __future__ import annotations
 
+import time
+
 import pandas as pd
 import streamlit as st
 
@@ -69,6 +71,13 @@ def init_state():
         # 特別休業日・臨時営業日の設定を、最後にどの月度分をセッションへ
         # 読み込んだか(=ディスクとの同期状態)を追跡する。None は未読み込み。
         st.session_state.special_days_period = None
+    if "priority_periods" not in st.session_state:
+        # 重点配置期間(特定期間・特定店舗で正社員/嘱託(/店長)を極力休ませない設定)。
+        # 月度に紐付かず全期間共通のため、セッション開始時に一度だけ読み込む。
+        try:
+            st.session_state.priority_periods = utils.load_priority_periods()
+        except Exception:
+            st.session_state.priority_periods = []
 
 
 init_state()
@@ -267,18 +276,22 @@ except Exception as e:
 
 closed_days_count_sidebar = int((~dates_df["is_business_day"]).sum())
 special_closure_count_sidebar = int(dates_df["is_special_closure"].sum())
-base_holiday_quota = closed_days_count_sidebar + 1
+forced_open_count_sidebar = int(dates_df["is_forced_open"].sum())
+# 臨時営業日(本来は定休日だった日を今回だけ営業日にした日)の分だけ、個別公休を
+# 追加で1日ずつ確保する(=振替休日に相当)。これが無いと、臨時営業日を設定した
+# 分だけ基準公休日数が実質的に目減りしてしまう(2026/11修正)。
+base_holiday_quota = closed_days_count_sidebar + 1 + forced_open_count_sidebar
 base_workdays_sidebar = len(period_dates) - base_holiday_quota
 st.sidebar.metric(
     "店長・正社員 基準公休日数(自動計算)",
     f"{base_holiday_quota}日",
     help=(
         f"総定休日数({closed_days_count_sidebar}日 ※特別休業日{special_closure_count_sidebar}日を含む)"
-        f" ＋ 個別公休1日 = {base_holiday_quota}日。基準出勤日数は "
-        f"{len(period_dates)}日 − {base_holiday_quota}日 = {base_workdays_sidebar}日です。"
+        f" ＋ 個別公休1日 ＋ 臨時営業日の振替({forced_open_count_sidebar}日) = {base_holiday_quota}日。"
+        f"基準出勤日数は {len(period_dates)}日 − {base_holiday_quota}日 = {base_workdays_sidebar}日です。"
     ),
 )
-time_limit_sec = st.sidebar.slider("最適化 計算時間上限(秒)", min_value=10, max_value=180, value=30, step=10)
+time_limit_sec = st.sidebar.slider("最適化 計算時間上限(秒)", min_value=10, max_value=180, value=60, step=10)
 
 st.sidebar.markdown("---")
 run_clicked = st.sidebar.button("🚀 最適化を実行", type="primary", width="stretch")
@@ -298,6 +311,7 @@ if run_clicked:
             requests_df=st.session_state.requests_df,
             base_holiday_quota=base_holiday_quota,
             time_limit_sec=time_limit_sec,
+            priority_periods=st.session_state.get("priority_periods", []),
         )
     st.session_state.solve_result = result
     st.session_state.solve_result_period = (int(year), int(month))
@@ -409,6 +423,84 @@ with tab1:
                         label_visibility="collapsed",
                     ) or utils.DEFAULT_FORCED_OPEN_LABEL
                 st.session_state.forced_open_reasons[label] = choice
+
+    st.markdown("---")
+    st.subheader("🛡️ 重点配置期間（特定期間は正社員・嘱託等を極力休ませない）の設定")
+    st.caption(
+        "初売りなどの繁忙期に、指定した期間・店舗・区分(店長/正社員/嘱託)のスタッフの"
+        "個別公休をできるだけ避ける設定です。月度に関係なく繰り返し使え、一度登録すれば"
+        "対象期間を含むどの月度でも自動的に適用されます。本人が既に希望休・絶対休・"
+        "有給申請を出している日は、そちらが優先されます(ソフトな優先ルールのため"
+        "100%の保証ではありません)。"
+    )
+    # 「全店を対象にする」はフォームの外に置く(フォーム内のウィジェットは送信まで
+    # 再実行されず、対象店舗欄の有効/無効がチェック操作に追従しないため)。
+    pp_all_stores = st.checkbox("全店を対象にする", value=True, key="pp_all_stores")
+    with st.form("priority_period_add_form", clear_on_submit=True):
+        pp_col1, pp_col2 = st.columns(2)
+        with pp_col1:
+            pp_start = st.date_input("開始日", key="pp_start_date")
+        with pp_col2:
+            pp_end = st.date_input("終了日", key="pp_end_date")
+        pp_stores = st.multiselect(
+            "対象店舗（「全店を対象にする」のチェックを外すと選べます）",
+            options=utils.STORES,
+            key="pp_stores",
+            disabled=pp_all_stores,
+        )
+        pp_emp_types = st.multiselect(
+            "対象区分",
+            options=utils.PRIORITY_PERIOD_EMP_TYPE_OPTIONS,
+            default=["正社員", "嘱託"],
+            key="pp_emp_types",
+        )
+        pp_label = st.text_input("メモ(任意、例: 年始の初売り)", key="pp_label")
+        pp_submitted = st.form_submit_button("＋ 追加")
+        if pp_submitted:
+            if pp_end < pp_start:
+                st.warning("終了日は開始日以降の日付にしてください。")
+            elif not pp_emp_types:
+                st.warning("対象区分を1つ以上選択してください。")
+            else:
+                new_entry = {
+                    "id": f"{int(time.time() * 1000)}",
+                    "start_date": pp_start,
+                    "end_date": pp_end,
+                    "stores": "ALL" if pp_all_stores else pp_stores,
+                    "emp_types": pp_emp_types,
+                    "label": pp_label,
+                }
+                updated = st.session_state.priority_periods + [new_entry]
+                try:
+                    utils.save_priority_periods(updated)
+                    st.session_state.priority_periods = updated
+                    st.toast("重点配置期間を追加しました。", icon="✅")
+                except Exception as e:
+                    st.warning(f"重点配置期間の保存に失敗しました。(詳細: {e})")
+                st.rerun()
+
+    if st.session_state.priority_periods:
+        st.caption("現在登録されている重点配置期間:")
+        for entry in st.session_state.priority_periods:
+            stores_label = "全店" if entry.get("stores") == "ALL" else "・".join(entry.get("stores") or [])
+            emp_label = "・".join(entry.get("emp_types") or [])
+            period_label_pp = f"{entry['start_date'].strftime('%Y/%m/%d')} 〜 {entry['end_date'].strftime('%Y/%m/%d')}"
+            note = f"（{entry['label']}）" if entry.get("label") else ""
+            pp_row1, pp_row2 = st.columns([5, 1])
+            with pp_row1:
+                st.markdown(f"- **{period_label_pp}**{note}　対象店舗: {stores_label}　対象区分: {emp_label}")
+            with pp_row2:
+                if st.button("削除", key=f"pp_delete_{entry['id']}"):
+                    updated = [e for e in st.session_state.priority_periods if e["id"] != entry["id"]]
+                    try:
+                        utils.save_priority_periods(updated)
+                        st.session_state.priority_periods = updated
+                        st.toast("重点配置期間を削除しました。", icon="🗑️")
+                    except Exception as e:
+                        st.warning(f"重点配置期間の削除(保存)に失敗しました。(詳細: {e})")
+                    st.rerun()
+    else:
+        st.caption("現在、登録されている重点配置期間はありません。")
 
     st.markdown("---")
     st.subheader(f"営業日一覧 — {period_label}")
@@ -587,7 +679,15 @@ with tab2:
     admin_mode = st.checkbox("管理者モードで編集する", key="kyuka_admin_mode")
     if not admin_mode:
         styled_matrix = utils.style_kyuka_wide_matrix(wide_matrix)
-        st.dataframe(styled_matrix, width="stretch", height=400, hide_index=True)
+        st.dataframe(
+            styled_matrix,
+            width="stretch",
+            height=400,
+            hide_index=True,
+            column_config={
+                "スタッフ名": st.column_config.Column("スタッフ名", pinned=True),
+            },
+        )
     else:
         st.caption(
             "🔵希望休 / 🟠絶対休 / 🩷有給申請 　※文字色は変更できないため、"
@@ -598,7 +698,7 @@ with tab2:
         edited_matrix = st.data_editor(
             emoji_wide_matrix,
             column_config={
-                "スタッフ名": st.column_config.TextColumn("スタッフ名", disabled=True),
+                "スタッフ名": st.column_config.TextColumn("スタッフ名", disabled=True, pinned=True),
                 **{
                     col: st.column_config.SelectboxColumn(col, options=emoji_options)
                     for col in date_cols

@@ -72,6 +72,12 @@ SPECIAL_DAYS_SHEET = "special_days"
 SPECIAL_DAYS_COLUMNS = ["year", "month", "date", "category", "reason"]
 # category: "special_closure"(特別休業日) または "forced_open"(臨時営業日)
 
+PRIORITY_PERIODS_SHEET = "priority_periods"
+PRIORITY_PERIODS_COLUMNS = ["id", "start_date", "end_date", "stores", "emp_types", "label"]
+# stores: "ALL"(全店) または店舗名のJSON配列。emp_types: 区分名("店長"/"正社員"/"嘱託")のJSON配列。
+# 月度に紐付かない全期間共通の設定(=特定の月に限らず繰り返し使える設定)として、
+# 全件をまるごと置換保存する方式(スタッフ名簿と同じ方式)を採る。
+
 STAFF_SHEET = "staff_roster"
 # リスト型・複雑な値を持つ列はJSON文字列として1セルに格納する。
 STAFF_JSON_COLUMNS = [
@@ -279,6 +285,43 @@ def save_special_days(
     if out_rows:
         ws.append_rows(out_rows, value_input_option="RAW")
     load_special_days_all.clear()
+
+
+# ---------------------------------------------------------------------------
+# 重点配置期間(特定期間・特定店舗で正社員/嘱託等を極力休ませない設定、
+# 全件を毎回まるごと置換保存する、少量データのシート)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_priority_periods_all() -> pd.DataFrame:
+    """重点配置期間の設定を全件読み込む。結果はキャッシュする
+    (理由・ttl値はload_kyuka_logのコメントを参照)。"""
+    ws = _get_or_create_worksheet(PRIORITY_PERIODS_SHEET, PRIORITY_PERIODS_COLUMNS)
+    return _records_to_df(ws, PRIORITY_PERIODS_COLUMNS)
+
+
+def save_priority_periods(records: list[dict]) -> None:
+    """重点配置期間の設定一覧を全件置換で保存する(スタッフ名簿と同じ方式)。"""
+    ws = _get_or_create_worksheet(PRIORITY_PERIODS_SHEET, PRIORITY_PERIODS_COLUMNS)
+    rows = []
+    for r in records:
+        stores_val = r.get("stores", "ALL")
+        stores_cell = stores_val if stores_val == "ALL" else json.dumps(stores_val, ensure_ascii=False)
+        rows.append(
+            [
+                str(r.get("id", "")),
+                r["start_date"].isoformat() if isinstance(r.get("start_date"), dt.date) else str(r.get("start_date", "")),
+                r["end_date"].isoformat() if isinstance(r.get("end_date"), dt.date) else str(r.get("end_date", "")),
+                stores_cell,
+                json.dumps(r.get("emp_types", []), ensure_ascii=False),
+                r.get("label", ""),
+            ]
+        )
+    ws.clear()
+    ws.append_row(PRIORITY_PERIODS_COLUMNS)
+    if rows:
+        ws.append_rows(rows, value_input_option="RAW")
+    load_priority_periods_all.clear()
 
 
 # ---------------------------------------------------------------------------

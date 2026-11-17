@@ -50,11 +50,15 @@ W_PAIR_REQUIREMENT = 1200  # 期間内必須ペア勤務(例: 辻本+尾澤@大�
 W_SHOKUTAKU_BONUS = 6   # 嘱託が1日出勤するごとの報酬(負の目的関数寄与)。
                         # 最低日数で頭打ちにせず、上限日数まで積極的に組み込み、
                         # 正社員の有休取得可能枠(店舗の余剰人員)を創出するための重み。
-W_PART_BONUS = 5        # パート(尾澤/野道/柴田)が1日出勤するごとの報酬(負の目的関数寄与)。
+W_PART_BONUS = 20       # パート(尾澤/野道/柴田)が1日出勤するごとの報酬(負の目的関数寄与)。
                         # 上限日数付近まで積極的に活用し、正社員の有休枠創出につなげる。
-W_STORE_PATTERN_PREF = 5  # 店舗の平日体制パターンに関するソフトな優先度。
+                        # (2026/11: 従来の5点では嘱託の最低勤務日数ペナルティ(800点)等に
+                        # 埋もれ、柴田が設定レンジ(11〜14日)を大きく下回る(実績6日)まま
+                        # 放置される事例が確認されたため、20点に引き上げた。)
+W_STORE_PATTERN_PREF = 20  # 店舗の平日体制パターンに関するソフトな優先度。
                           # 正の値=社員2名体制を優先(パート併用を軽く抑制)、
                           # 負の値=社員1名+パート体制を優先(パート併用を軽く推奨)。
+                          # (2026/11: 上記W_PART_BONUSと同じ理由で5点から引き上げ。)
 W_TOKUSHIGE_LEAVE_SLOT_BONUS = 5  # 徳重店: 月末火曜日以外の通常の平日についても、
                           # 「社員1名+パート不動野+パート前田」の3名体制を組むことを
                           # 推奨する(負の重み=報酬)ための係数。社員の有給取得可能日
@@ -97,6 +101,15 @@ W_YAMAOKA_TAKEUCHI_KANIE_SWAP = 20  # 山岡が新蟹江店に配属され、か
                         # W_SHORTAGE等のより重いペナルティが優先されるよう、
                         # W_INAZAWA_PRIORITY・W_WEEKEND_HOLIDAY_AVOID(=50)より
                         # 明確に弱い値にしている。
+W_PRIORITY_STAFFING = 25  # 「重点配置期間」(カレンダー設定画面で登録、例: 年始の初売り
+                        # 期間)に該当する、対象区分(店長/正社員/嘱託)・対象店舗の
+                        # スタッフが、その期間中に個別の公休を取ったことへの軽いペナルティ。
+                        # 希望休・絶対休・有給申請が既に出ている日はそれらが優先されるため
+                        # 対象外とする(=希望休等と競合しない設計)。店舗の人員不足解消
+                        # (W_SHORTAGE=1000等)や既存の優先順位ルール(W_INAZAWA_PRIORITY等
+                        # =50)よりは明確に弱いが、W_PART_BONUS・W_STORE_PATTERN_PREF
+                        # (=20)よりは強い値にして、この期間を避けて個別公休を配置する
+                        # ことを実質的に優先させる(2026/11新設)。
 
 BIG_M = 10
 
@@ -145,6 +158,7 @@ def solve_shift(
     requests_df: pd.DataFrame,
     base_holiday_quota: int,
     time_limit_sec: int = 30,
+    priority_periods: list[dict] | None = None,
 ) -> SolveResult:
     model = cp_model.CpModel()
 
@@ -381,6 +395,44 @@ def solve_shift(
             violation = model.NewBoolVar(f"yamaoka_takeuchi_kanie_swap_violation_{d.isoformat()}")
             model.Add(yamaoka_kanie + cp_model.LinearExpr.Sum(takeuchi_other_terms) <= 1 + violation)
             penalty_terms.append((violation, W_YAMAOKA_TAKEUCHI_KANIE_SWAP))
+
+    # --- 4h. 重点配置期間(特定期間・特定店舗で正社員/嘱託(/店長)を極力休ませない、ソフト) --
+    #     カレンダー設定画面で登録した「重点配置期間」(priority_periods、例: 年始の
+    #     初売り期間)ごとに、対象区分(店長/正社員/嘱託)かつ対象店舗に出勤し得る
+    #     スタッフについて、期間内の営業日に個別の公休を割り当てることへ軽い
+    #     ペナルティを課す。これにより、「店長・正社員は期間内に必ずどこかで1日
+    #     個別公休を取る」という既存のハード制約(11.参照)や、嘱託の勤務日数レンジ
+    #     消化(8.参照)が、この指定期間を避ける方向にソフトに誘導される。本人が
+    #     希望休・絶対休・有給申請を既に出している日は、それらが優先されるため
+    #     対象外とする(=希望休等と競合しない設計。2026/11新設)。
+    for p_idx, period in enumerate(priority_periods or []):
+        p_start = period.get("start_date")
+        p_end = period.get("end_date")
+        target_emp_types = set(period.get("emp_types") or [])
+        if not p_start or not p_end or not target_emp_types:
+            continue
+        p_target_stores = period.get("stores", "ALL")
+        period_days = [d for d in business_days if p_start <= d <= p_end]
+        if not period_days:
+            continue
+        for row in staff_df.itertuples():
+            sid = row.staff_id
+            if row.emp_type not in target_emp_types:
+                continue
+            allowed = effective_allowed[sid]
+            if p_target_stores != "ALL" and not (set(allowed) & set(p_target_stores)):
+                continue
+            for d in period_days:
+                if d in hard_off_dates.get(sid, set()):
+                    continue
+                if d in soft_off_dates.get(sid, {}):
+                    continue
+                day_expr = _day_work_expr(work_vars, sid, d, allowed)
+                if isinstance(day_expr, int) and day_expr == 0:
+                    continue
+                rest_var = model.NewBoolVar(f"priority_rest_{p_idx}_{sid}_{d.isoformat()}")
+                model.Add(day_expr + rest_var == 1)
+                penalty_terms.append((rest_var, W_PRIORITY_STAFFING))
 
     # --- 5. 最大6連勤(7日ウィンドウの合計<=6) --------------------------------
     for row in staff_df.itertuples():

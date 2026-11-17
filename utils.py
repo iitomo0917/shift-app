@@ -210,6 +210,7 @@ def classify_days(
                 "is_weekend_or_holiday": is_weekend_or_holiday(d),
                 "holiday_name": holiday_name,
                 "is_special_closure": is_special_closure,
+                "is_forced_open": d in forced_open_set,
             }
         )
     return pd.DataFrame(rows)
@@ -625,6 +626,66 @@ def save_special_days(
 ) -> None:
     """指定月度の特別休業日・臨時営業日の設定をGoogleスプレッドシートへ保存する。"""
     sheets_store.save_special_days(year, month, special_closure_map, forced_open_map)
+
+
+# ---------------------------------------------------------------------------
+# 重点配置期間(特定期間・特定店舗で、正社員/嘱託(/店長)を極力休ませない設定)
+# ---------------------------------------------------------------------------
+# 月度に紐付かず、設定した期間は毎月繰り返し有効になる(=仕組み化)。
+# 希望休が既に出ている日については、この設定よりも希望休が優先される
+# (ソフト制約・optimizer.py側で希望休が出ている日はペナルティ自体を課さない)。
+
+PRIORITY_PERIOD_EMP_TYPE_OPTIONS = ["店長", "正社員", "嘱託"]
+
+
+def load_priority_periods() -> list[dict]:
+    """重点配置期間の設定一覧を、Googleスプレッドシートから読み込む。
+
+    各要素: {"id": str, "start_date": date, "end_date": date,
+            "stores": "ALL" または 店舗名のリスト, "emp_types": 区分名のリスト, "label": str}
+    未設定・接続エラーの場合は空リストを返す(アプリ全体をクラッシュさせないための安全側フォールバック)。
+    """
+    try:
+        df = sheets_store.load_priority_periods_all()
+    except Exception:
+        return []
+    if df.empty:
+        return []
+    records: list[dict] = []
+    for _, r in df.iterrows():
+        try:
+            start = dt.date.fromisoformat(r["start_date"])
+            end = dt.date.fromisoformat(r["end_date"])
+        except (TypeError, ValueError):
+            continue
+        stores_raw = r.get("stores")
+        if not stores_raw or stores_raw == "ALL":
+            stores: str | list[str] = "ALL"
+        else:
+            try:
+                stores = json.loads(stores_raw)
+            except (TypeError, ValueError):
+                stores = "ALL"
+        try:
+            emp_types = json.loads(r.get("emp_types") or "[]")
+        except (TypeError, ValueError):
+            emp_types = []
+        records.append(
+            {
+                "id": r.get("id") or "",
+                "start_date": start,
+                "end_date": end,
+                "stores": stores,
+                "emp_types": emp_types,
+                "label": r.get("label") or "",
+            }
+        )
+    return records
+
+
+def save_priority_periods(records: list[dict]) -> None:
+    """重点配置期間の設定一覧をGoogleスプレッドシートへ保存する(全件置換)。"""
+    sheets_store.save_priority_periods(records)
 
 
 def append_kyuka_request(staff_name: str, date: dt.date, request_type: str, _period_key: str | None = None) -> None:
