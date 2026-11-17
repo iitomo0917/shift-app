@@ -246,6 +246,7 @@ if st.session_state.solve_result is None and st.session_state.get("_pending_shif
             staff_summary_df=_restored_summary,
             objective_value=float(_loaded_meta.get("objective_value", 0.0)),
             solver_wall_time=float(_loaded_meta.get("solver_wall_time", 0.0)),
+            quota_overflow_alerts=[],
         )
         st.session_state.solve_result_period = (year, month)
         _wide = utils.build_manual_shift_wide(_loaded_shift_df, dates_df)
@@ -323,7 +324,10 @@ if run_clicked:
     st.session_state.solve_result = result
     st.session_state.solve_result_period = (int(year), int(month))
     if result.is_feasible:
-        st.sidebar.success(f"完了: {result.status_name} (不足アラート {len(result.shortages)}件)")
+        st.sidebar.success(
+            f"完了: {result.status_name} (不足アラート {len(result.shortages)}件、"
+            f"個別公休枠超過アラート {len(result.quota_overflow_alerts)}件)"
+        )
         # 新しい最適化結果が出るたびに、手動編集用のワイド表を初期化する
         # (=以前の手動調整はリセットされる。個別にリセットしたい場合は
         # タブ3の「手動変更をリセット」ボタンで初期状態に戻せる)。
@@ -944,6 +948,17 @@ with tab3:
         else:
             effective_shift_df = result.shift_df
         st.session_state.effective_shift_df = effective_shift_df
+
+        if result.quota_overflow_alerts:
+            st.warning(
+                f"⚠️ 個別公休枠(火水の営業日数)を超える絶対休が申請されているスタッフが"
+                f" {len(result.quota_overflow_alerts)} 名います(出勤日数はその分さらに減っています)。"
+            )
+            for a in result.quota_overflow_alerts:
+                st.markdown(
+                    f"- {a['name']}（{a['区分']}）: 絶対休{a['絶対休日数']}日 / "
+                    f"個別公休枠{a['個別公休枠']}日 → 超過{a['超過日数']}日分"
+                )
 
         st.subheader("不足アラート・警告（現在のシフト状態をリアルタイム反映）")
         st.caption(

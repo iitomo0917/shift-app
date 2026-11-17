@@ -118,6 +118,7 @@ class SolveResult:
     staff_summary_df: pd.DataFrame
     objective_value: float
     solver_wall_time: float
+    quota_overflow_alerts: list[dict]
 
 
 def _day_work_expr(work_vars, sid, d, allowed_stores):
@@ -746,17 +747,26 @@ def solve_shift(
     #     〔最終火曜日の短縮営業分〕だが、臨時営業日を追加すればその分だけ
     #     増える＝臨時営業日の振替休日が自動的にこの枠に含まれる。)
     #
-    #     出勤日数 ＝ 営業日数 − 個別公休枠 − (期間内の絶対休・有給申請の日数)
-    #     を全員ハード制約として固定する。絶対休・有給申請は上の4.で既に
-    #     出勤不可(0)に固定済みのため、この等式は「それらを除いた残りの
-    #     個別公休枠ぶんだけ、ソルバーが店舗体制を見ながら自由に休みの日を
-    #     選ぶ」ことを強制する。
+    #     絶対休と有給申請は、出勤不可(0)に固定される点は上の4.で共通だが、
+    #     出勤日数の計算上は意味が異なる(2026/11: 経営者との確認により区別):
+    #       ・絶対休 ＝ 個別公休枠のうち「どの日を休みにするか」を本人が指定
+    #                  するもの。指定日数が個別公休枠の範囲内であれば、
+    #                  出勤日数は変わらない(単に休む日付が固定されるだけ)。
+    #       ・有給申請 ＝ 個別公休枠とは別枠の、純粋な追加の休み。1日につき
+    #                  出勤日数をさらに1日減らす。
+    #       ・絶対休が個別公休枠を上回って申請された場合、超過分は(本人が
+    #         絶対に休む以上)有給申請と同様に追加の休みとして扱い、出勤日数を
+    #         その分さらに減らす。この超過は想定外のケースのため、
+    #         quota_overflow_alerts としてアラートに計上し、app.py側で
+    #         経営者に通知する。
     #
-    #     この結果、店舗の必要人員等との組み合わせでどうしても実現できない
-    #     場合は、ソルバーが INFEASIBLE となり計算が失敗する(意図した挙動。
-    #     app.py側でエラーとして表示する)。
+    #     出勤日数 ＝ 営業日数 − max(個別公休枠, 絶対休日数) − 有給申請日数
+    #     を全員ハード制約として固定する。この結果、店舗の必要人員等との
+    #     組み合わせでどうしても実現できない場合は、ソルバーが INFEASIBLE と
+    #     なり計算が失敗する(意図した挙動。app.py側でエラーとして表示する)。
     n_business_days = len(business_days)
     individual_off_quota = utils.individual_off_quota(dates_df)
+    quota_overflow_alerts: list[dict] = []
     for row in salaried_staff.itertuples():
         sid = row.staff_id
         total_work_expr = cp_model.LinearExpr.Sum(
@@ -772,8 +782,30 @@ def solve_shift(
                 if (sid, preferred_off, st_) in work_vars:
                     model.Add(work_vars[(sid, preferred_off, st_)] == 0)
 
-        hard_off_count_in_period = len(hard_off_dates.get(sid, set()) & set(business_days))
-        model.Add(total_work_expr == n_business_days - individual_off_quota - hard_off_count_in_period)
+        absolute_off_count = 0
+        paid_leave_count = 0
+        if not requests_df.empty:
+            own_requests = requests_df[
+                (requests_df["staff_id"] == sid) & (requests_df["date"].isin(business_days))
+            ]
+            absolute_off_count = int((own_requests["kind"] == "絶対休").sum())
+            paid_leave_count = int((own_requests["kind"] == "有給申請").sum())
+
+        quota_overflow = max(0, absolute_off_count - individual_off_quota)
+        if quota_overflow > 0:
+            quota_overflow_alerts.append(
+                {
+                    "staff_id": sid,
+                    "name": row.name,
+                    "区分": row.emp_type,
+                    "絶対休日数": absolute_off_count,
+                    "個別公休枠": individual_off_quota,
+                    "超過日数": quota_overflow,
+                }
+            )
+
+        effective_off_days = max(individual_off_quota, absolute_off_count) + paid_leave_count
+        model.Add(total_work_expr == n_business_days - effective_off_days)
 
     # --- 12. 土日出勤の公平化(ソフト・ミニマックス) ----------------------------
     weekend_days = [d for d in business_days if d.weekday() in (5, 6)]
@@ -827,7 +859,7 @@ def solve_shift(
     is_feasible = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
 
     if not is_feasible:
-        return SolveResult(status_name, False, pd.DataFrame(), [], pd.DataFrame(), 0.0, solver.WallTime())
+        return SolveResult(status_name, False, pd.DataFrame(), [], pd.DataFrame(), 0.0, solver.WallTime(), [])
 
     # --- 結果抽出 ---------------------------------------------------------
     shift_rows = []
@@ -939,4 +971,5 @@ def solve_shift(
         staff_summary_df=staff_summary_df,
         objective_value=solver.ObjectiveValue(),
         solver_wall_time=solver.WallTime(),
+        quota_overflow_alerts=quota_overflow_alerts,
     )

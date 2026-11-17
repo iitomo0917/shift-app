@@ -74,38 +74,33 @@ def check_salaried_workdays_exact(
     base_holiday_quota: int | None = None,
 ) -> list[str]:
     """店長・正社員の出勤日数が
-    「営業日数 − 個別公休枠(火水の営業日数) − 期間内の絶対休・有給申請日数」に
-    厳格一致しているか(2026/11: 出勤日数ルールのハード制約化に合わせて更新)。
+    「営業日数 − max(個別公休枠, 絶対休日数) − 有給申請日数」に厳格一致しているか
+    (2026/11: 絶対休=個別公休枠内の指定、有給申請=枠外の追加休み、という区別に
+    合わせて更新。枠を超える絶対休は追加休み扱いになる)。
 
     個別公休枠そのものは対象期間のカレンダーから utils.individual_off_quota() で
-    動的に導出する(固定値をハードコードしない)。絶対休・有給申請を1件も持たない
-    スタッフは「基準出勤日数と厳格一致」、n件持つスタッフは「基準出勤日数-n日」を
-    期待値とする。base_holiday_quota は旧シグネチャとの互換のため残しているが
-    使用しない(未指定でよい)。
+    動的に導出する(固定値をハードコードしない)。base_holiday_quota は旧
+    シグネチャとの互換のため残しているが使用しない(未指定でよい)。
     """
     issues = []
     n_business_days = int(dates_df["is_business_day"].sum())
     individual_off_quota = utils.individual_off_quota(dates_df)
-    expected_workdays = n_business_days - individual_off_quota
     salaried = staff_df[staff_df["emp_type"].isin(["店長", "正社員"])]
     business_days = set(dates_df.loc[dates_df["is_business_day"], "date"])
     for _, row in salaried.iterrows():
         sid = row["staff_id"]
         cnt = len(shift_df[shift_df["staff_id"] == sid]) if not shift_df.empty else 0
-        confirmed_cnt = 0
+        absolute_cnt = 0
+        paid_cnt = 0
         if not requests_df.empty:
-            confirmed_cnt = int(
-                (
-                    (requests_df["staff_id"] == sid)
-                    & (requests_df["kind"].isin(utils.HARD_OFF_KINDS))
-                    & (requests_df["date"].isin(business_days))
-                ).sum()
-            )
-        expected = expected_workdays - confirmed_cnt
+            own = requests_df[(requests_df["staff_id"] == sid) & (requests_df["date"].isin(business_days))]
+            absolute_cnt = int((own["kind"] == "絶対休").sum())
+            paid_cnt = int((own["kind"] == "有給申請").sum())
+        expected = n_business_days - max(individual_off_quota, absolute_cnt) - paid_cnt
         if cnt != expected:
             issues.append(
                 f"{row['name']}: 出勤{cnt}日"
-                f"(期待値{expected}日 = 基準{expected_workdays}日-絶対休/有給申請{confirmed_cnt}日)"
+                f"(期待値{expected}日 = 営業日{n_business_days}日-max(枠{individual_off_quota},絶対休{absolute_cnt})-有給{paid_cnt})"
             )
     return issues
 

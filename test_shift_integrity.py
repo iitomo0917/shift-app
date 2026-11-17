@@ -55,22 +55,27 @@ def check_seishain_workdays(result, staff_df, dates_df, requests_df=None) -> lis
     個別公休枠(=期間内の営業日のうち火曜日・水曜日の日数)は暦月ごとの曜日配置に
     よって変動するため、固定値ではなく utils.individual_off_quota() による
     実際のカレンダーからの導出値と比較する。
+
+    絶対休と有給申請は意味が異なる(2026/11更新): 絶対休は個別公休枠の中の
+    「どの日を休みにするか」の指定であり、枠の範囲内であれば出勤日数を
+    減らさない。枠を超えた分・有給申請は常に追加の休みとして出勤日数を
+    1日ずつ減らす。
     """
     issues = []
     n_business_days = int(dates_df["is_business_day"].sum())
     individual_off_quota = utils.individual_off_quota(dates_df)
-    base_expected = n_business_days - individual_off_quota
     salaried = staff_df[staff_df["emp_type"].isin(["店長", "正社員"])]
+    business_days = set(dates_df.loc[dates_df["is_business_day"], "date"])
     for _, row in salaried.iterrows():
-        hard_off_cnt = 0
+        absolute_cnt = 0
+        paid_cnt = 0
         if requests_df is not None and not requests_df.empty:
-            hard_off_cnt = int(
-                (
-                    (requests_df["staff_id"] == row["staff_id"])
-                    & (requests_df["kind"].isin(utils.HARD_OFF_KINDS))
-                ).sum()
-            )
-        expected_workdays = base_expected - hard_off_cnt
+            own = requests_df[
+                (requests_df["staff_id"] == row["staff_id"]) & (requests_df["date"].isin(business_days))
+            ]
+            absolute_cnt = int((own["kind"] == "絶対休").sum())
+            paid_cnt = int((own["kind"] == "有給申請").sum())
+        expected_workdays = n_business_days - max(individual_off_quota, absolute_cnt) - paid_cnt
         cnt = len(result.shift_df[result.shift_df["staff_id"] == row["staff_id"]])
         if cnt != expected_workdays:
             issues.append(f"{row['name']}: 出勤{cnt}日(期待値{expected_workdays}日)")
