@@ -36,33 +36,41 @@ def setup_default_scenario():
     dates_df = utils.classify_days(dates)
     staff_df = utils.default_staff_df()
     requests_df = utils.default_requests_df()
-    closed_days = int((~dates_df["is_business_day"]).sum())
-    base_holiday_quota = closed_days + 1
     result = solve_shift(
         dates_df=dates_df,
         staff_df=staff_df,
         requests_df=requests_df,
-        base_holiday_quota=base_holiday_quota,
         time_limit_sec=90,
     )
-    return dates_df, staff_df, requests_df, result, base_holiday_quota
+    return dates_df, staff_df, requests_df, result, None
 
 
 # ---------------------------------------------------------------------------
 # 1. 正社員・店長の出勤日数(基準出勤日数の厳守)
 # ---------------------------------------------------------------------------
-def check_seishain_workdays(result, staff_df, dates_df, base_holiday_quota) -> list[str]:
-    """期待出勤日数は「期間の総日数 − 基準公休日数」で動的に算出する。
+def check_seishain_workdays(result, staff_df, dates_df, requests_df=None) -> list[str]:
+    """期待出勤日数は「営業日数 − 個別公休枠 − (期間内の絶対休・有給申請日数)」で
+    動的に算出する(2026/11: ハード制約化に合わせて更新)。
 
-    基準公休日数(=総定休日数+個別公休1日)は暦月ごとの曜日配置(水曜・火曜の
-    出現回数)によって変動するため、"21日"のような固定値ではなく、対象期間の
-    実際のカレンダーから導出した期待値と比較する(2026年9月度はたまたま21日に
-    なるが、これは一般則ではない)。
+    個別公休枠(=期間内の営業日のうち火曜日・水曜日の日数)は暦月ごとの曜日配置に
+    よって変動するため、固定値ではなく utils.individual_off_quota() による
+    実際のカレンダーからの導出値と比較する。
     """
     issues = []
-    expected_workdays = len(dates_df) - base_holiday_quota
+    n_business_days = int(dates_df["is_business_day"].sum())
+    individual_off_quota = utils.individual_off_quota(dates_df)
+    base_expected = n_business_days - individual_off_quota
     salaried = staff_df[staff_df["emp_type"].isin(["店長", "正社員"])]
     for _, row in salaried.iterrows():
+        hard_off_cnt = 0
+        if requests_df is not None and not requests_df.empty:
+            hard_off_cnt = int(
+                (
+                    (requests_df["staff_id"] == row["staff_id"])
+                    & (requests_df["kind"].isin(utils.HARD_OFF_KINDS))
+                ).sum()
+            )
+        expected_workdays = base_expected - hard_off_cnt
         cnt = len(result.shift_df[result.shift_df["staff_id"] == row["staff_id"]])
         if cnt != expected_workdays:
             issues.append(f"{row['name']}: 出勤{cnt}日(期待値{expected_workdays}日)")
@@ -164,10 +172,7 @@ def check_wakamatsu_shinkanie_soft_last_resort() -> list[str]:
         {"date": target, "store": "新蟹江店", "names": ["若松"], "exclude_others": False, "note": "test"},
     ]
     try:
-        closed_days = int((~dates_df["is_business_day"]).sum())
-        result = solve_shift(
-            dates_df, staff_df, requests_df, base_holiday_quota=closed_days + 1, time_limit_sec=60
-        )
+        result = solve_shift(dates_df, staff_df, requests_df, time_limit_sec=60)
         if not result.is_feasible:
             issues.append(
                 f"若松を{target}の新蟹江店へ強制配置するとINFEASIBLEになった"
@@ -291,8 +296,7 @@ def check_leave_candidate_excludes_already_off(staff_df, dates_df) -> list[str]:
     )
     dates = utils.get_period_dates(2026, 9)
     dates_df2 = utils.classify_days(dates)
-    closed_days = int((~dates_df2["is_business_day"]).sum())
-    result = solve_shift(dates_df2, staff_df, requests_df, base_holiday_quota=closed_days + 1, time_limit_sec=90)
+    result = solve_shift(dates_df2, staff_df, requests_df, time_limit_sec=90)
     if not result.is_feasible:
         return ["休み希望シナリオの求解に失敗(INFEASIBLE)"]
 
@@ -427,12 +431,11 @@ def check_different_period_no_crash() -> list[str]:
     dates_df = utils.classify_days(dates)
     staff_df = utils.default_staff_df()
     requests_df = utils.default_requests_df()
-    closed_days = int((~dates_df["is_business_day"]).sum())
-    result = solve_shift(dates_df, staff_df, requests_df, base_holiday_quota=closed_days + 1, time_limit_sec=90)
+    result = solve_shift(dates_df, staff_df, requests_df, time_limit_sec=90)
     if not result.is_feasible:
         return [f"6月度期間の求解に失敗: {result.status_name}"]
     issues.extend(
-        [f"(6月度) {m}" for m in check_seishain_workdays(result, staff_df, dates_df, closed_days + 1)]
+        [f"(6月度) {m}" for m in check_seishain_workdays(result, staff_df, dates_df, requests_df)]
     )
     real_shortages, skill_issues, duplicates = check_store_requirements(result, staff_df, dates_df)
     issues.extend([f"(6月度) {m}" for m in real_shortages])
@@ -441,7 +444,7 @@ def check_different_period_no_crash() -> list[str]:
 
 
 def check_special_closure_days_integration() -> list[str]:
-    """特別休業日を追加した期間でも、基準公休日数の自動計算・21日ルールからの
+    """特別休業日を追加した期間でも、個別公休枠の自動計算・出勤日数ハード制約からの
     差分・不足許容日以外の店舗成立要件が正しく保たれることを確認する。"""
     issues = []
     dates = utils.get_period_dates(2026, 9)
@@ -453,9 +456,10 @@ def check_special_closure_days_integration() -> list[str]:
     special_count = int(dates_df["is_special_closure"].sum())
     if closed_days != 8 + special_count:
         issues.append(f"総定休日数の計算不整合: closed={closed_days}, special={special_count}")
-    base_quota = closed_days + 1
-    expected_workdays = len(dates) - base_quota
-    result = solve_shift(dates_df, staff_df, requests_df, base_holiday_quota=base_quota, time_limit_sec=90)
+    n_business_days = int(dates_df["is_business_day"].sum())
+    individual_off_quota = utils.individual_off_quota(dates_df)
+    expected_workdays = n_business_days - individual_off_quota
+    result = solve_shift(dates_df, staff_df, requests_df, time_limit_sec=90)
     if not result.is_feasible:
         return issues + [f"特別休業日ありの求解に失敗: {result.status_name}"]
     salaried = staff_df[staff_df["emp_type"].isin(["店長", "正社員"])]
@@ -469,9 +473,15 @@ def check_special_closure_days_integration() -> list[str]:
     return issues
 
 
-def check_heavy_conflict_no_crash() -> list[str]:
-    """大量の絶対休が重複しても、ソルバーがクラッシュ(INFEASIBLE)せず、
-    不足として警告付きで解を返すことを確認する(既存の設計方針の回帰確認)。"""
+def check_heavy_conflict_no_python_crash() -> list[str]:
+    """大量の絶対休が重複した極端なケースでも、solve_shift自体が例外で
+    クラッシュせず、必ずSolveResultを返すことを確認する。
+
+    (2026/11: 出勤日数ルールを真のハード制約化したことに伴い、この種の極端な
+    衝突ではINFEASIBLE(求解失敗)を返すことが正しい挙動になった
+    〔経営者の了承済み。app.py側でエラー表示する〕。そのためこのテストでは
+    「必ずFEASIBLEになる」ことは検証せず、「Pythonレベルの例外を起こさず
+    SolveResultを返す」ことのみを検証する。"""
     dates = utils.get_period_dates(2026, 9)
     dates_df = utils.classify_days(dates)
     staff_df = utils.default_staff_df()
@@ -482,10 +492,12 @@ def check_heavy_conflict_no_crash() -> list[str]:
         for d in biz_days[:15]:
             rows.append({"staff_id": sid, "name": name, "date": d, "kind": "絶対休"})
     requests_df = pd.DataFrame(rows)
-    closed_days = int((~dates_df["is_business_day"]).sum())
-    result = solve_shift(dates_df, staff_df, requests_df, base_holiday_quota=closed_days + 1, time_limit_sec=90)
-    if not result.is_feasible:
-        return [f"大量休み希望衝突時にソルバーがクラッシュ: {result.status_name}"]
+    try:
+        result = solve_shift(dates_df, staff_df, requests_df, time_limit_sec=90)
+    except Exception as e:  # noqa: BLE001
+        return [f"大量休み希望衝突時にPython例外でクラッシュ: {e!r}"]
+    if result is None or not hasattr(result, "is_feasible"):
+        return ["大量休み希望衝突時にSolveResultが返らなかった"]
     return []
 
 
@@ -696,7 +708,7 @@ def main():
     print("シフト最適化アプリ 網羅的整合性検証")
     print("=" * 70)
 
-    dates_df, staff_df, requests_df, result, base_holiday_quota = setup_default_scenario()
+    dates_df, staff_df, requests_df, result, _ = setup_default_scenario()
     print(f"ソルバーステータス: {result.status_name} (feasible={result.is_feasible})")
     if not result.is_feasible:
         print("!!! ソルバーが解を返しませんでした。以降の検証を中止します。")
@@ -704,7 +716,7 @@ def main():
 
     record(
         "1. 正社員・店長の出勤日数(基準出勤日数の厳守)",
-        check_seishain_workdays(result, staff_df, dates_df, base_holiday_quota),
+        check_seishain_workdays(result, staff_df, dates_df, requests_df),
     )
 
     real_shortages, skill_issues, duplicates = check_store_requirements(result, staff_df, dates_df)
@@ -737,7 +749,7 @@ def main():
 
     record("6a. 別期間(10/10を含まない月)でのクラッシュ非発生と基本要件", check_different_period_no_crash())
     record("6b. 特別休業日を含む期間の整合性", check_special_closure_days_integration())
-    record("6c. 大量休み希望衝突時のクラッシュ非発生", check_heavy_conflict_no_crash())
+    record("6c. 大量休み希望衝突時のクラッシュ非発生(Python例外のみ)", check_heavy_conflict_no_python_crash())
     record("7a. check_manual_shift_alerts の異常入力耐性", check_manual_shift_alerts_robustness())
     record(
         "7b. 月度切り替え時のクラッシュ非発生・希望休/特別休業日データの分離と保持",

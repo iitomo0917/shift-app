@@ -35,11 +35,6 @@ W_SHORTAGE = 1000       # 店舗の必要人員(社員/パート組合せ)が満
 W_SKILL = 500           # 測定・加工スキル保有者が1人もいない
 W_SHOKUTAKU_MIN = 800   # 嘱託の期間内最低勤務日数を満たせない
 W_PART_RANGE = 700      # パートの期間内勤務日数が許容レンジ[min,max]を外れた
-W_HOLIDAY_DEV = 900     # 店長・正社員の出勤日数が規定(21日、有給申請者は20日等)から
-                        # 1日でもズレることへの重いペナルティ。店舗の必要人員/スキル要件
-                        # (W_SHORTAGE/W_SKILL)には次ぐが、他の全てのソフト優先度
-                        # (パート活用・嘱託ボーナス・優先店舗など)を確実に上回るよう、
-                        # 意図的に高く設定している(=事実上のハード制約として機能させる)。
 W_SOFT_REQUEST = 15     # 希望休を無視して出勤させた(唯一のソフト制約。有給申請は
                         # 絶対休と同様の完全なハード制約のため、ここには登場しない)。
 W_HELP = 1              # 正社員が主所属以外の店舗に出た(ヘルプ)回数
@@ -156,7 +151,6 @@ def solve_shift(
     dates_df: pd.DataFrame,
     staff_df: pd.DataFrame,
     requests_df: pd.DataFrame,
-    base_holiday_quota: int,
     time_limit_sec: int = 30,
     priority_periods: list[dict] | None = None,
 ) -> SolveResult:
@@ -164,7 +158,6 @@ def solve_shift(
 
     business_days = list(dates_df.loc[dates_df["is_business_day"], "date"])
     all_days = list(dates_df["date"])
-    closed_days_count = int((~dates_df["is_business_day"]).sum())
     # 土曜・日曜・祝日のうち営業日であるものの集合(店舗別の土日祝限定ルールに使用)
     weekend_holiday_days: set = set(
         dates_df.loc[dates_df["is_business_day"] & dates_df["is_weekend_or_holiday"], "date"]
@@ -737,55 +730,50 @@ def solve_shift(
         if other_store_terms:
             penalty_terms.append((cp_model.LinearExpr.Sum(other_store_terms), W_PREFERRED_STORE))
 
-    # --- 11. 店長+正社員: 出勤日数を規定日数(21日/有給申請者は20日等)に厳格化 -----
-    #     W_HOLIDAY_DEV を非常に重く設定しているため、事実上のハード制約として
-    #     機能する(店舗人員・スキル要件のみを上回って優先される)。それでも数式上は
-    #     スラック変数を介した制約のため、極端な休み希望の衝突があってもソルバーが
-    #     INFEASIBLE で落ちることはなく、必ず解が得られる。
-    target_off = max(0, base_holiday_quota - closed_days_count)
+    # --- 11. 店長+正社員: 出勤日数を真のハード制約として固定する ---------------
+    #     (2026/11: 従来はW_HOLIDAY_DEVという重いソフト制約(900点)で「事実上の
+    #     ハード制約」として運用していたが、店舗の必要人員(W_SHORTAGE=1000点)や
+    #     必須ペア勤務(W_PAIR_REQUIREMENT=1200点)など、これより重いペナルティに
+    #     よって出勤日数の均一化が崩れ、人によって出勤日数に数日単位のばらつきが
+    #     発生する事例が確認された。経営者との確認の結果、以下の定義による
+    #     「個別公休枠」を真のハード制約(スラックなし)に変更した。
+    #
+    #     個別公休枠(individual_off_quota) ＝ シフト期間内の営業日のうち、
+    #     火曜日・水曜日にあたる日数。
+    #     (定休日は基本的に火・水に設定されているため、この枠は「その月の
+    #     最終火曜日(短縮営業で営業日になる)」や「臨時営業日の設定で定休日から
+    #     営業日に変わった火・水」の日数と自動的に一致する。通常の月は1日
+    #     〔最終火曜日の短縮営業分〕だが、臨時営業日を追加すればその分だけ
+    #     増える＝臨時営業日の振替休日が自動的にこの枠に含まれる。)
+    #
+    #     出勤日数 ＝ 営業日数 − 個別公休枠 − (期間内の絶対休・有給申請の日数)
+    #     を全員ハード制約として固定する。絶対休・有給申請は上の4.で既に
+    #     出勤不可(0)に固定済みのため、この等式は「それらを除いた残りの
+    #     個別公休枠ぶんだけ、ソルバーが店舗体制を見ながら自由に休みの日を
+    #     選ぶ」ことを強制する。
+    #
+    #     この結果、店舗の必要人員等との組み合わせでどうしても実現できない
+    #     場合は、ソルバーが INFEASIBLE となり計算が失敗する(意図した挙動。
+    #     app.py側でエラーとして表示する)。
     n_business_days = len(business_days)
-    holiday_dev_info = {}
+    individual_off_quota = utils.individual_off_quota(dates_df)
     for row in salaried_staff.itertuples():
         sid = row.staff_id
         total_work_expr = cp_model.LinearExpr.Sum(
             [_day_work_expr(work_vars, sid, d, effective_allowed[sid]) for d in business_days]
         )
 
-        if n_business_days >= 1:
-            # 店長・正社員11名は、定休日を除いた基準公休の「残り1日」を必ず
-            # 個別公休(出勤なし)として取得できるようにする(ハード制約)。
-            # その日の店舗体制は他店舗からのヘルプ(正社員/嘱託)で維持される
-            # (店舗別必要体制のハード制約/不足ペナルティが別途保証する)。
-            model.Add(total_work_expr <= n_business_days - 1)
-
         preferred_off = getattr(row, "preferred_off_date", None)
         if pd.notna(preferred_off) and preferred_off in business_days:
             # 個別公休の希望日が指定されている場合は、その日を確定公休として
-            # ハード制約化する(希望日が無指定の場合はAIが上のキャップの範囲内で
-            # 全社体制のバランスを見て自動的に1日を選ぶ)。
+            # ハード制約化する(希望日が無指定の場合はAIが下の等式制約の範囲内で
+            # 全社体制のバランスを見て自動的に休日を選ぶ)。
             for st_ in effective_allowed[sid]:
                 if (sid, preferred_off, st_) in work_vars:
                     model.Add(work_vars[(sid, preferred_off, st_)] == 0)
 
-        confirmed_paid_leave = 0
-        if not requests_df.empty:
-            confirmed_paid_leave = int(
-                (
-                    (requests_df["staff_id"] == sid)
-                    & (requests_df["kind"] == "有給申請")
-                    & (requests_df["date"].isin(business_days))
-                ).sum()
-            )
-        # off_business_days = n_business_days - total_work
-        # koukyuu_equivalent = off_business_days - confirmed_paid_leave
-        dev_pos = model.NewIntVar(0, n_business_days, f"dev_pos_{sid}")
-        dev_neg = model.NewIntVar(0, n_business_days, f"dev_neg_{sid}")
-        model.Add(
-            (n_business_days - total_work_expr) - confirmed_paid_leave - target_off == dev_pos - dev_neg
-        )
-        penalty_terms.append((dev_pos, W_HOLIDAY_DEV))
-        penalty_terms.append((dev_neg, W_HOLIDAY_DEV))
-        holiday_dev_info[sid] = (dev_pos, dev_neg, confirmed_paid_leave)
+        hard_off_count_in_period = len(hard_off_dates.get(sid, set()) & set(business_days))
+        model.Add(total_work_expr == n_business_days - individual_off_quota - hard_off_count_in_period)
 
     # --- 12. 土日出勤の公平化(ソフト・ミニマックス) ----------------------------
     weekend_days = [d for d in business_days if d.weekday() in (5, 6)]

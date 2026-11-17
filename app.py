@@ -277,18 +277,26 @@ except Exception as e:
 closed_days_count_sidebar = int((~dates_df["is_business_day"]).sum())
 special_closure_count_sidebar = int(dates_df["is_special_closure"].sum())
 forced_open_count_sidebar = int(dates_df["is_forced_open"].sum())
-# 臨時営業日(本来は定休日だった日を今回だけ営業日にした日)の分だけ、個別公休を
-# 追加で1日ずつ確保する(=振替休日に相当)。これが無いと、臨時営業日を設定した
-# 分だけ基準公休日数が実質的に目減りしてしまう(2026/11修正)。
-base_holiday_quota = closed_days_count_sidebar + 1 + forced_open_count_sidebar
-base_workdays_sidebar = len(period_dates) - base_holiday_quota
+# 個別公休枠＝シフト期間内の営業日のうち、火曜日・水曜日にあたる日数。
+# (2026/11: 経営者との確認により、「個別公休1日＋臨時営業日の振替」という
+# 旧計算式を廃止し、この定義に統一した。定休日は基本的に火・水に設定されて
+# いるため、この枠は「その月の最終火曜日(短縮営業)」や「臨時営業日の設定で
+# 定休日から営業日に変わった火・水」の日数と自動的に一致し、臨時営業日の
+# 振替休日も自動的にこの枠に含まれる。optimizer.py側でも全く同じ定義で
+# 真のハード制約として計算しており、ここは画面表示用に同じ値を再現している。)
+individual_off_quota_sidebar = utils.individual_off_quota(dates_df)
+base_workdays_sidebar = len(period_dates) - closed_days_count_sidebar - individual_off_quota_sidebar
 st.sidebar.metric(
-    "店長・正社員 基準公休日数(自動計算)",
-    f"{base_holiday_quota}日",
+    "店長・正社員 個別公休枠(自動計算)",
+    f"{individual_off_quota_sidebar}日",
     help=(
-        f"総定休日数({closed_days_count_sidebar}日 ※特別休業日{special_closure_count_sidebar}日を含む)"
-        f" ＋ 個別公休1日 ＋ 臨時営業日の振替({forced_open_count_sidebar}日) = {base_holiday_quota}日。"
-        f"基準出勤日数は {len(period_dates)}日 − {base_holiday_quota}日 = {base_workdays_sidebar}日です。"
+        f"総定休日数({closed_days_count_sidebar}日 ※特別休業日{special_closure_count_sidebar}日・"
+        f"臨時営業日{forced_open_count_sidebar}日を反映済み) に加えて、"
+        f"営業日のうち火・水にあたる日数({individual_off_quota_sidebar}日、臨時営業日の振替分を含む)を"
+        "個別公休としてハード制約で確保します。"
+        f"基準出勤日数は {len(period_dates)}日 − {closed_days_count_sidebar}日 − "
+        f"{individual_off_quota_sidebar}日 = {base_workdays_sidebar}日です"
+        "(絶対休・有給申請を使った分はさらにここから減ります)。"
     ),
 )
 time_limit_sec = st.sidebar.slider("最適化 計算時間上限(秒)", min_value=10, max_value=180, value=60, step=10)
@@ -309,7 +317,6 @@ if run_clicked:
             dates_df=dates_df,
             staff_df=staff_df,
             requests_df=st.session_state.requests_df,
-            base_holiday_quota=base_holiday_quota,
             time_limit_sec=time_limit_sec,
             priority_periods=st.session_state.get("priority_periods", []),
         )

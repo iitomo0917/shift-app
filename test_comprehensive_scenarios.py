@@ -71,16 +71,22 @@ def check_salaried_workdays_exact(
     staff_df: pd.DataFrame,
     dates_df: pd.DataFrame,
     requests_df: pd.DataFrame,
-    base_holiday_quota: int,
+    base_holiday_quota: int | None = None,
 ) -> list[str]:
-    """店長・正社員の出勤日数が「基準出勤日数 − 期間内の有給申請日数」に厳格一致しているか。
+    """店長・正社員の出勤日数が
+    「営業日数 − 個別公休枠(火水の営業日数) − 期間内の絶対休・有給申請日数」に
+    厳格一致しているか(2026/11: 出勤日数ルールのハード制約化に合わせて更新)。
 
-    基準出勤日数そのものは対象期間のカレンダーから動的に導出する(固定値を
-    ハードコードしない)。有給申請を1件も持たないスタッフは「基準出勤日数と
-    厳格一致」、有給申請をn件持つスタッフは「基準出勤日数-n日」を期待値とする。
+    個別公休枠そのものは対象期間のカレンダーから utils.individual_off_quota() で
+    動的に導出する(固定値をハードコードしない)。絶対休・有給申請を1件も持たない
+    スタッフは「基準出勤日数と厳格一致」、n件持つスタッフは「基準出勤日数-n日」を
+    期待値とする。base_holiday_quota は旧シグネチャとの互換のため残しているが
+    使用しない(未指定でよい)。
     """
     issues = []
-    expected_workdays = len(dates_df) - base_holiday_quota
+    n_business_days = int(dates_df["is_business_day"].sum())
+    individual_off_quota = utils.individual_off_quota(dates_df)
+    expected_workdays = n_business_days - individual_off_quota
     salaried = staff_df[staff_df["emp_type"].isin(["店長", "正社員"])]
     business_days = set(dates_df.loc[dates_df["is_business_day"], "date"])
     for _, row in salaried.iterrows():
@@ -91,7 +97,7 @@ def check_salaried_workdays_exact(
             confirmed_cnt = int(
                 (
                     (requests_df["staff_id"] == sid)
-                    & (requests_df["kind"] == "有給申請")
+                    & (requests_df["kind"].isin(utils.HARD_OFF_KINDS))
                     & (requests_df["date"].isin(business_days))
                 ).sum()
             )
@@ -99,21 +105,28 @@ def check_salaried_workdays_exact(
         if cnt != expected:
             issues.append(
                 f"{row['name']}: 出勤{cnt}日"
-                f"(期待値{expected}日 = 基準{expected_workdays}日-有給申請{confirmed_cnt}日)"
+                f"(期待値{expected}日 = 基準{expected_workdays}日-絶対休/有給申請{confirmed_cnt}日)"
             )
     return issues
 
 
 def check_individual_off_day_preserved(shift_df: pd.DataFrame, staff_df: pd.DataFrame, dates_df: pd.DataFrame) -> list[str]:
-    """店長・正社員が営業日の中で最低1日は個別公休を確保できているか(ハード制約の健全性)。"""
+    """店長・正社員の出勤日数が、個別公休枠(火水の営業日数)を踏まえた上限を
+    超えていないか(ハード制約の健全性。2026/11: 固定の「-1日」から、カレンダー
+    から動的に導出する個別公休枠に更新)。"""
     issues = []
     n_business_days = int(dates_df["is_business_day"].sum())
+    individual_off_quota = utils.individual_off_quota(dates_df)
+    max_workdays = n_business_days - individual_off_quota
     salaried = staff_df[staff_df["emp_type"].isin(["店長", "正社員"])]
     for _, row in salaried.iterrows():
         sid = row["staff_id"]
         cnt = len(shift_df[shift_df["staff_id"] == sid]) if not shift_df.empty else 0
-        if n_business_days >= 1 and cnt > n_business_days - 1:
-            issues.append(f"{row['name']}: 出勤{cnt}日(営業日{n_business_days}日中、個別公休1日が確保されていない)")
+        if cnt > max_workdays:
+            issues.append(
+                f"{row['name']}: 出勤{cnt}日(営業日{n_business_days}日中、"
+                f"個別公休枠{individual_off_quota}日が確保されていない)"
+            )
     return issues
 
 
@@ -369,15 +382,14 @@ def run_common_post_solve_checks(
     staff_df: pd.DataFrame,
     requests_df: pd.DataFrame,
     result,
-    base_holiday_quota: int,
     strict_day_ranges: bool = True,
     strict_store_headcount: bool = True,
 ) -> None:
     record(scenario, "有給申請日の出勤ゼロ", check_confirmed_leave_zero_attendance(result.shift_df, requests_df))
     record(
         scenario,
-        "店長・正社員の出勤日数(基準日数-有給申請日数に厳格一致)",
-        check_salaried_workdays_exact(result.shift_df, staff_df, dates_df, requests_df, base_holiday_quota),
+        "店長・正社員の出勤日数(基準日数-絶対休/有給申請日数に厳格一致)",
+        check_salaried_workdays_exact(result.shift_df, staff_df, dates_df, requests_df),
     )
     record(scenario, "個別公休1日の確保", check_individual_off_day_preserved(result.shift_df, staff_df, dates_df))
 
@@ -455,14 +467,12 @@ def scenario_a_normal_month() -> None:
         requests_rows.append(_req(name_to_id, "田中", slot_days[0], "有給申請"))
 
     requests_df = pd.DataFrame(requests_rows, columns=["staff_id", "name", "date", "kind"])
-    closed_days = int((~dates_df["is_business_day"]).sum())
-    base_holiday_quota = closed_days + 1
 
-    result = solve_shift(dates_df, staff_df, requests_df, base_holiday_quota=base_holiday_quota, time_limit_sec=60)
+    result = solve_shift(dates_df, staff_df, requests_df, time_limit_sec=60)
     if not record(scenario, "求解可能性(FEASIBLE/OPTIMAL)", [] if result.is_feasible else [f"ステータス={result.status_name}"]):
         return
 
-    run_common_post_solve_checks(scenario, dates_df, staff_df, requests_df, result, base_holiday_quota)
+    run_common_post_solve_checks(scenario, dates_df, staff_df, requests_df, result)
 
     record(
         scenario,
@@ -517,15 +527,13 @@ def scenario_b_concentrated_leave() -> None:
         requests_rows.append(_req(name_to_id, "竹内", h1, "有給申請"))  # 嘱託(全店ヘルプ可)
 
     requests_df = pd.DataFrame(requests_rows, columns=["staff_id", "name", "date", "kind"])
-    closed_days = int((~dates_df["is_business_day"]).sum())
-    base_holiday_quota = closed_days + 1
 
-    result = solve_shift(dates_df, staff_df, requests_df, base_holiday_quota=base_holiday_quota, time_limit_sec=90)
+    result = solve_shift(dates_df, staff_df, requests_df, time_limit_sec=90)
     if not record(scenario, "求解可能性(FEASIBLE/OPTIMAL・負荷集中下でもクラッシュしない)", [] if result.is_feasible else [f"ステータス={result.status_name}"]):
         return
 
     run_common_post_solve_checks(
-        scenario, dates_df, staff_df, requests_df, result, base_holiday_quota, strict_store_headcount=False
+        scenario, dates_df, staff_df, requests_df, result, strict_store_headcount=False
     )
 
 
@@ -553,10 +561,12 @@ def scenario_c_special_closures() -> None:
         issues_count.append(f"定休日数が+3日になっていない(通常{closed_days_baseline}日→特別休業込み{closed_days}日)")
     record(scenario, "特別休業日3日分が定休日数へ正しく加算されているか", issues_count)
 
-    base_holiday_quota_baseline = closed_days_baseline + 1
-    base_holiday_quota = closed_days + 1
-    expected_workdays_baseline = len(dates_df_baseline) - base_holiday_quota_baseline
-    expected_workdays = len(dates_df) - base_holiday_quota
+    n_business_days_baseline = int(dates_df_baseline["is_business_day"].sum())
+    n_business_days = int(dates_df["is_business_day"].sum())
+    individual_off_quota_baseline = utils.individual_off_quota(dates_df_baseline)
+    individual_off_quota = utils.individual_off_quota(dates_df)
+    expected_workdays_baseline = n_business_days_baseline - individual_off_quota_baseline
+    expected_workdays = n_business_days - individual_off_quota
 
     issues_formula = []
     if expected_workdays != expected_workdays_baseline - 3:
@@ -569,16 +579,18 @@ def scenario_c_special_closures() -> None:
         )
     record(scenario, "特別休業日3日による正社員出勤日数の減算式(21日→18日相当)", issues_formula)
 
-    # 個別公休1日はどちらの状態でも変わらず1日のみ(=特別休業日が個別公休枠を
-    # 侵食も上乗せもしない)であることを確認する。
-    target_off_baseline = max(0, base_holiday_quota_baseline - closed_days_baseline)
-    target_off = max(0, base_holiday_quota - closed_days)
+    # 個別公休枠(火水の営業日数)は、今回追加した3日分の特別休業日がいずれも
+    # 火・水以外の営業日であるため、どちらの状態でも変わらないはず
+    # (＝特別休業日が個別公休枠を侵食も上乗せもしない)ことを確認する。
     issues_target_off = []
-    if target_off_baseline != 1 or target_off != 1:
-        issues_target_off.append(f"個別公休1日の想定が崩れている(通常{target_off_baseline}日、特別休業込み{target_off}日)")
-    record(scenario, "個別公休1日が特別休業日の有無に関わらず維持されているか", issues_target_off)
+    if individual_off_quota_baseline != individual_off_quota:
+        issues_target_off.append(
+            f"個別公休枠が特別休業日の追加で変化している(通常{individual_off_quota_baseline}日、"
+            f"特別休業込み{individual_off_quota}日)"
+        )
+    record(scenario, "個別公休枠が特別休業日の有無に関わらず維持されているか", issues_target_off)
 
-    result = solve_shift(dates_df, staff_df, requests_df, base_holiday_quota=base_holiday_quota, time_limit_sec=60)
+    result = solve_shift(dates_df, staff_df, requests_df, time_limit_sec=60)
     if not record(scenario, "求解可能性(FEASIBLE/OPTIMAL)", [] if result.is_feasible else [f"ステータス={result.status_name}"]):
         return
 
@@ -590,7 +602,7 @@ def scenario_c_special_closures() -> None:
     record(scenario, "特別休業日は全店舗・全スタッフが休みになっているか", issues_closure_off)
 
     run_common_post_solve_checks(
-        scenario, dates_df, staff_df, requests_df, result, base_holiday_quota, strict_day_ranges=False
+        scenario, dates_df, staff_df, requests_df, result, strict_day_ranges=False
     )
 
 
