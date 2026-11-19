@@ -608,13 +608,18 @@ def _sheets_setup_error(exc: Exception) -> str:
 def load_special_days(year: int, month: int) -> tuple[dict[dt.date, str], dict[dt.date, str]]:
     """指定月度の特別休業日・臨時営業日の設定を、Googleスプレッドシートから読み込む。
 
-    未設定・接続エラーの場合は、両方とも空の辞書(=何も指定なし)を返す
-    (アプリ全体をクラッシュさせないための安全側フォールバック)。
+    未設定(接続は成功したがデータが0件)の場合のみ、両方とも空の辞書(=何も指定なし)
+    を返す。接続エラー時は例外をそのまま呼び出し元(app.py)へ送出する。
+
+    (2026/11修正: 以前はここで例外を握りつぶして空の設定を返していたが、app.py側は
+    月度切り替えのたびにこの関数で読み込んだ内容をそのままGoogleスプレッドシートへ
+    自動保存する作りになっているため、APIの一時的なエラー等でこの読み込みが失敗した
+    タイミングで月度を切り替えると、「空の設定」が正しい内容として誤って自動保存され、
+    既存の設定が消えてしまう不具合があった。呼び出し元側で、読み込み失敗時は
+    自動保存を必ずスキップするよう修正済み。本関数は「読み込み失敗」と「本当に
+    未設定」を呼び出し元が区別できるよう、失敗時は例外を送出するだけにする。)
     """
-    try:
-        df = sheets_store.load_special_days_all()
-    except Exception:
-        return {}, {}
+    df = sheets_store.load_special_days_all()
     if df.empty:
         return {}, {}
     df = df[(df["year"].astype(str) == str(year)) & (df["month"].astype(str) == str(month))]
@@ -657,12 +662,17 @@ def load_priority_periods() -> list[dict]:
 
     各要素: {"id": str, "start_date": date, "end_date": date,
             "stores": "ALL" または 店舗名のリスト, "emp_types": 区分名のリスト, "label": str}
-    未設定・接続エラーの場合は空リストを返す(アプリ全体をクラッシュさせないための安全側フォールバック)。
+    未設定(接続は成功したがデータが0件)の場合のみ空リストを返す。接続エラー時は
+    例外をそのまま呼び出し元(app.py)へ送出する。
+
+    (2026/11修正: 以前はここで例外を握りつぶして空リストを返していたが、起動直後の
+    読み込みがAPIの一時的なエラー等で失敗した場合、空リストがそのまま
+    st.session_state.priority_periodsにセットされ、その後に「＋追加」「削除」操作を
+    1回でも行うと、その空リストを基準に全件置換保存されてしまい、既存の重点配置期間が
+    すべて消えてしまう不具合があった。呼び出し元側で、読み込み失敗時は追加・削除の
+    保存操作自体を無効化するよう修正済み。)
     """
-    try:
-        df = sheets_store.load_priority_periods_all()
-    except Exception:
-        return []
+    df = sheets_store.load_priority_periods_all()
     if df.empty:
         return []
     records: list[dict] = []

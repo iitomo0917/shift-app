@@ -74,10 +74,19 @@ def init_state():
     if "priority_periods" not in st.session_state:
         # 重点配置期間(特定期間・特定店舗で正社員/嘱託(/店長)を極力休ませない設定)。
         # 月度に紐付かず全期間共通のため、セッション開始時に一度だけ読み込む。
+        #
+        # (2026/11修正: 以前は読み込み失敗時に空リストをそのままセットしていたため、
+        # 起動直後の読み込みがAPIの一時的なエラー等で失敗した場合、その空リストを
+        # 基準に「＋追加」「削除」操作が全件置換保存を行い、既存の重点配置期間が
+        # すべて消えてしまう不具合があった。読み込みの成否を
+        # priority_periods_load_ok に記録し、失敗時はTab1側で追加・削除の保存操作
+        # 自体を無効化する。)
         try:
             st.session_state.priority_periods = utils.load_priority_periods()
+            st.session_state.priority_periods_load_ok = True
         except Exception:
             st.session_state.priority_periods = []
+            st.session_state.priority_periods_load_ok = False
 
 
 init_state()
@@ -153,25 +162,45 @@ date_to_special_closure_label = {d: l for l, d in special_closure_label_to_date.
 # これにより、月をまたいで先行入力した特別休業日・臨時営業日の設定が、
 # プルダウンを元の月に戻しても失われないようにしている
 # (kyuka_requests_*.csvと同様、月度ごとに専用のファイルへ保存する方式)。
+#
+# (2026/11修正: 以前はutils.load_special_daysが接続エラーを握りつぶして空の
+# 設定を返していたため、この読み込みが一時的なAPIエラーで失敗したタイミングで
+# 月度を切り替えると、下の自動保存ブロックが「空の設定」を正しい内容として
+# そのままGoogleスプレッドシートへ上書きしてしまい、既存の設定が消える不具合が
+# あった。読み込みを例外処理で囲み、失敗時は _special_days_load_failed を立てて
+# 下の自動保存ブロックを必ずスキップするようにした。また special_days_period を
+# 更新しないため、次回の再実行時に自動的に読み込みを再試行する。)
+_special_days_load_failed = False
 if st.session_state.special_days_period != (year, month):
-    _loaded_special_closure_map, _loaded_forced_open_map = utils.load_special_days(year, month)
-    st.session_state.special_closure_labels = [
-        date_to_special_closure_label[d] for d in _loaded_special_closure_map if d in date_to_special_closure_label
-    ]
-    st.session_state.special_closure_reasons = {
-        date_to_special_closure_label[d]: r
-        for d, r in _loaded_special_closure_map.items()
-        if d in date_to_special_closure_label
-    }
-    st.session_state.forced_open_labels = [
-        date_to_special_closure_label[d] for d in _loaded_forced_open_map if d in date_to_special_closure_label
-    ]
-    st.session_state.forced_open_reasons = {
-        date_to_special_closure_label[d]: r
-        for d, r in _loaded_forced_open_map.items()
-        if d in date_to_special_closure_label
-    }
-    st.session_state.special_days_period = (year, month)
+    try:
+        _loaded_special_closure_map, _loaded_forced_open_map = utils.load_special_days(year, month)
+    except Exception as e:
+        _special_days_load_failed = True
+        st.sidebar.warning(
+            "特別休業日・臨時営業日の設定の読み込みに失敗しました。表示内容が実際の"
+            "保存内容と異なっている可能性があるため、今回はこの画面での自動保存を"
+            f"行っていません。少し操作し直すか、画面を再読み込みしてください。(詳細: {e})"
+        )
+    else:
+        st.session_state.special_closure_labels = [
+            date_to_special_closure_label[d]
+            for d in _loaded_special_closure_map
+            if d in date_to_special_closure_label
+        ]
+        st.session_state.special_closure_reasons = {
+            date_to_special_closure_label[d]: r
+            for d, r in _loaded_special_closure_map.items()
+            if d in date_to_special_closure_label
+        }
+        st.session_state.forced_open_labels = [
+            date_to_special_closure_label[d] for d in _loaded_forced_open_map if d in date_to_special_closure_label
+        ]
+        st.session_state.forced_open_reasons = {
+            date_to_special_closure_label[d]: r
+            for d, r in _loaded_forced_open_map.items()
+            if d in date_to_special_closure_label
+        }
+        st.session_state.special_days_period = (year, month)
 
 special_closure_map: dict = {
     special_closure_label_to_date[l]: st.session_state.special_closure_reasons.get(
@@ -203,8 +232,14 @@ forced_open_map: dict = {
 # 見える不具合があった。保存を try/except で囲み、失敗時は画面をクラッシュさせず
 # 警告表示のみにとどめ、_special_days_last_savedも更新しない(次回の再実行時に
 # 自動的に再試行される)よう修正した。
+#
+# (2026/11修正: _special_days_load_failed が立っている回(=上のブロックで月度
+# 切り替えに伴う読み込みが失敗した回)は、special_closure_map/forced_open_mapが
+# 「読み込み失敗前のセッション内容」のままで信頼できないため、自動保存を必ず
+# スキップする。special_days_periodを更新していないため、次回の再実行時に
+# 読み込みから自動的にやり直され、読み込みが成功した回にのみ改めて保存される。)
 _special_days_snapshot = (year, month, special_closure_map, forced_open_map)
-if st.session_state.get("_special_days_last_saved") != _special_days_snapshot:
+if not _special_days_load_failed and st.session_state.get("_special_days_last_saved") != _special_days_snapshot:
     try:
         utils.save_special_days(year, month, special_closure_map, forced_open_map)
         st.session_state._special_days_last_saved = _special_days_snapshot
@@ -444,6 +479,24 @@ with tab1:
         "有給申請を出している日は、そちらが優先されます(ソフトな優先ルールのため"
         "100%の保証ではありません)。"
     )
+    # (2026/11追加: 起動時の読み込みが失敗したまま追加・削除を行うと、空リストを
+    # 基準に全件置換保存されて既存の設定が消えてしまうため、読み込みが成功するまで
+    # 追加・削除の保存操作自体を無効化する。)
+    if not st.session_state.get("priority_periods_load_ok", True):
+        st.warning(
+            "重点配置期間の読み込みに失敗しているため、既存の設定を誤って消さない"
+            "よう、追加・削除の保存操作を一時的に無効にしています。下のボタンで"
+            "再読み込みを試してください。"
+        )
+        if st.button("🔄 重点配置期間の再読み込みを試す", key="pp_retry_load"):
+            try:
+                st.session_state.priority_periods = utils.load_priority_periods()
+                st.session_state.priority_periods_load_ok = True
+                st.toast("重点配置期間の読み込みに成功しました。", icon="✅")
+            except Exception as e:
+                st.warning(f"再読み込みにも失敗しました。(詳細: {e})")
+            st.rerun()
+
     # 「全店を対象にする」はフォームの外に置く(フォーム内のウィジェットは送信まで
     # 再実行されず、対象店舗欄の有効/無効がチェック操作に追従しないため)。
     pp_all_stores = st.checkbox("全店を対象にする", value=True, key="pp_all_stores")
@@ -468,7 +521,12 @@ with tab1:
         pp_label = st.text_input("メモ(任意、例: 年始の初売り)", key="pp_label")
         pp_submitted = st.form_submit_button("＋ 追加")
         if pp_submitted:
-            if pp_end < pp_start:
+            if not st.session_state.get("priority_periods_load_ok", True):
+                st.warning(
+                    "重点配置期間の読み込みが完了していないため追加できません。"
+                    "上の「再読み込みを試す」ボタンをお試しください。"
+                )
+            elif pp_end < pp_start:
                 st.warning("終了日は開始日以降の日付にしてください。")
             elif not pp_emp_types:
                 st.warning("対象区分を1つ以上選択してください。")
@@ -502,14 +560,20 @@ with tab1:
                 st.markdown(f"- **{period_label_pp}**{note}　対象店舗: {stores_label}　対象区分: {emp_label}")
             with pp_row2:
                 if st.button("削除", key=f"pp_delete_{entry['id']}"):
-                    updated = [e for e in st.session_state.priority_periods if e["id"] != entry["id"]]
-                    try:
-                        utils.save_priority_periods(updated)
-                        st.session_state.priority_periods = updated
-                        st.toast("重点配置期間を削除しました。", icon="🗑️")
-                    except Exception as e:
-                        st.warning(f"重点配置期間の削除(保存)に失敗しました。(詳細: {e})")
-                    st.rerun()
+                    if not st.session_state.get("priority_periods_load_ok", True):
+                        st.warning(
+                            "重点配置期間の読み込みが完了していないため削除できません。"
+                            "上の「再読み込みを試す」ボタンをお試しください。"
+                        )
+                    else:
+                        updated = [e for e in st.session_state.priority_periods if e["id"] != entry["id"]]
+                        try:
+                            utils.save_priority_periods(updated)
+                            st.session_state.priority_periods = updated
+                            st.toast("重点配置期間を削除しました。", icon="🗑️")
+                        except Exception as e:
+                            st.warning(f"重点配置期間の削除(保存)に失敗しました。(詳細: {e})")
+                        st.rerun()
     else:
         st.caption("現在、登録されている重点配置期間はありません。")
 
